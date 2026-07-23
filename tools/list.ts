@@ -3,15 +3,17 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk"
 import type { HydraClient } from "../client.ts"
 import type { HydraPluginConfig } from "../config.ts"
 import { log } from "../log.ts"
+import { TOOL_NAMES } from "../tool-names.ts"
+import { registerToolWithAlias } from "./register.ts"
 
 export function registerListTool(
 	api: OpenClawPluginApi,
 	client: HydraClient,
 	_cfg: HydraPluginConfig,
 ): void {
-	api.registerTool(
+	registerToolWithAlias(
+		api,
 		{
-			name: "hydra_list_memories",
 			label: "Hydra List Memories",
 			description:
 				"List all user memories stored in Hydra. Returns memory IDs and content summaries. Use this when the user asks what you remember about them or wants to see their stored information.",
@@ -51,6 +53,7 @@ export function registerListTool(
 				}
 			},
 		},
-		{ name: "hydra_list_memories" },
+		TOOL_NAMES.LIST,
+		TOOL_NAMES.LIST_MEMORIES,
 	)
 }

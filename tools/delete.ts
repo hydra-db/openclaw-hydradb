@@ -3,15 +3,17 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk"
 import type { HydraClient } from "../client.ts"
 import type { HydraPluginConfig } from "../config.ts"
 import { log } from "../log.ts"
+import { TOOL_NAMES } from "../tool-names.ts"
+import { registerToolWithAlias } from "./register.ts"
 
 export function registerDeleteTool(
 	api: OpenClawPluginApi,
 	client: HydraClient,
 	_cfg: HydraPluginConfig,
 ): void {
-	api.registerTool(
+	registerToolWithAlias(
+		api,
 		{
-			name: "hydra_delete_memory",
 			label: "Hydra Delete Memory",
 			description:
 				"Delete a specific memory from Hydra by its memory ID. Use this when the user explicitly asks you to forget something or remove a specific piece of stored information. Always confirm the memory ID before deleting.",
@@ -49,6 +51,7 @@ export function registerDeleteTool(
 				}
 			},
 		},
-		{ name: "hydra_delete_memory" },
+		TOOL_NAMES.DELETE,
+		TOOL_NAMES.DELETE_MEMORY,
 	)
 }
