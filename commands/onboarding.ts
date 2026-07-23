@@ -6,6 +6,7 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk"
 import type { HydraClient } from "../client.ts"
 import type { HydraPluginConfig } from "../config.ts"
 import { log } from "../log.ts"
+import { warnDeprecated } from "../tool-names.ts"
 
 // ── Defaults (used when config is not yet available) ──
 
@@ -430,14 +431,25 @@ async function runAdvancedWizard(cfg?: HydraPluginConfig): Promise<void> {
 
 export function registerOnboardingCli(
 	cfg?: HydraPluginConfig,
+	// When set, this registrar is attached under the deprecated `hydra` root, so
+	// invoking `hydra onboard` emits the same one-time deprecation warning as the
+	// other legacy CLI verbs (CONTRACT §3), pointing at `<replacement> onboard`.
+	opts?: { deprecatedReplacement?: string },
 ): (root: any) => void {
 	return (root: any) => {
 		root
 			.command("onboard")
 			.description("Interactive Hydra DB onboarding wizard")
 			.option("--advanced", "Configure all options (credentials, behaviour, recall, debug)")
-			.action(async (opts: { advanced?: boolean }) => {
-				if (opts.advanced) {
+			.action(async (cmdOpts: { advanced?: boolean }) => {
+				if (opts?.deprecatedReplacement) {
+					warnDeprecated(
+						"CLI command",
+						"hydra onboard",
+						`${opts.deprecatedReplacement} onboard`,
+					)
+				}
+				if (cmdOpts.advanced) {
 					await runAdvancedWizard(cfg)
 				} else {
 					await runBasicWizard(cfg)

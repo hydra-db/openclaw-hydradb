@@ -48,7 +48,9 @@ export default {
 				const legacyRoot = program
 					.command("hydra")
 					.description("(deprecated — use `hydradb`) Hydra DB memory commands")
-				createOnboardingCliRegistrar(cfg ?? undefined)(legacyRoot)
+				createOnboardingCliRegistrar(cfg ?? undefined, {
+					deprecatedReplacement: "hydradb",
+				})(legacyRoot)
 				registerLegacyCliCommands(legacyRoot, cliClient, cfg)
 			},
 			{ commands: ["hydradb", "hydra"] },
