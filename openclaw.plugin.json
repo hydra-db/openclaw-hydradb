@@ -1,6 +1,23 @@
 {
 	"id": "openclaw",
 	"kind": "memory",
+	"activation": {
+		"onStartup": true
+	},
+	"contracts": {
+		"tools": [
+			"hydradb_query",
+			"hydradb_ingest",
+			"hydradb_list",
+			"hydradb_inspect",
+			"hydradb_delete",
+			"hydra_search",
+			"hydra_store",
+			"hydra_list_memories",
+			"hydra_get_content",
+			"hydra_delete_memory"
+		]
+	},
 	"uiHints": {
 		"apiKey": {
 			"label": "Hydra API Key",

@@ -13,7 +13,10 @@
   },
   "scripts": {
     "check-types": "tsc --noEmit",
-    "test": "tsx --test tests/**/*.test.ts conformance/**/*.test.ts",
+    "build": "esbuild index.ts --bundle --format=esm --platform=node --packages=external --outfile=dist/index.mjs",
+    "build:check": "esbuild index.ts --bundle --format=esm --platform=node --packages=external --outfile=/tmp/openclaw-dist-check.mjs && diff -q dist/index.mjs /tmp/openclaw-dist-check.mjs",
+    "prepack": "npm run build",
+    "test": "npm run build:check && tsx --test tests/**/*.test.ts conformance/**/*.test.ts",
     "test:conformance": "tsx --test conformance/**/*.test.ts"
   },
   "peerDependencies": {
@@ -22,10 +25,15 @@
   "openclaw": {
     "extensions": [
       "./index.ts"
-    ]
+    ],
+    "build": {
+      "openclawVersion": "2026.5.7",
+      "pluginSdkVersion": "2026.5.7"
+    }
   },
   "devDependencies": {
     "@types/node": "^20",
+    "esbuild": "0.28.1",
     "tsx": "^4.19.4",
     "typescript": "^5.9.3"
   }
