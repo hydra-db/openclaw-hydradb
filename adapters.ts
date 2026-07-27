@@ -93,11 +93,21 @@ function str(record: Record<string, unknown>, ...keys: string[]): string | undef
 	return undefined
 }
 
+function asRecords(value: unknown): Record<string, unknown>[] | undefined {
+	return Array.isArray(value) ? (value as Record<string, unknown>[]) : undefined
+}
+
 /** SDK list result → the legacy `ListMemoriesResponse`. Field names vary across v2 records, so read defensively. */
 export function toListMemoriesResponse(
 	data: SDK.ListV2SourceListResponse,
 ): ListMemoriesResponse {
-	const records = (data.inner?.sources ?? []) as Record<string, unknown>[]
+	// Memories surface at top-level `user_memories` — not under an `.inner`
+	// wrapper, and not under `sources` (that is the knowledge shape).
+	const d = data as unknown as Record<string, unknown>
+	const records =
+		asRecords(d.user_memories) ??
+		asRecords((d.inner as Record<string, unknown> | undefined)?.user_memories) ??
+		[]
 	return {
 		success: true,
 		user_memories: records.map((record) => ({
@@ -112,7 +122,12 @@ export function toListMemoriesResponse(
 export function toListSourcesResponse(
 	data: SDK.ListV2SourceListResponse,
 ): ListSourcesResponse {
-	const records = (data.inner?.sources ?? []) as Record<string, unknown>[]
+	// Knowledge sources surface at top-level `sources`, not under `.inner`.
+	const d = data as unknown as Record<string, unknown>
+	const records =
+		asRecords(d.sources) ??
+		asRecords((d.inner as Record<string, unknown> | undefined)?.sources) ??
+		[]
 	const sources = records.map((record) => ({
 		id: str(record, "id", "source_id") ?? "",
 		tenant_id: str(record, "tenant_id", "database") ?? "",
@@ -123,10 +138,12 @@ export function toListSourcesResponse(
 		timestamp: str(record, "timestamp"),
 		url: str(record, "url"),
 	}))
+	const total =
+		d.total ?? (d.inner as Record<string, unknown> | undefined)?.total
 	return {
 		success: true,
 		sources,
-		total: data.inner?.total ?? sources.length,
+		total: typeof total === "number" ? total : sources.length,
 	}
 }
 

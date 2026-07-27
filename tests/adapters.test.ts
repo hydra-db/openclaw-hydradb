@@ -146,21 +146,24 @@ test("toAddMemoryResponse maps successCount / failedCount", () => {
 })
 
 test("toListMemoriesResponse maps records defensively to user_memories", () => {
+	// The live API returns memories at top-level `user_memories`.
 	const direct = toListMemoriesResponse({
-		inner: { sources: [{ memory_id: "m1", memory_content: "hi" }] },
+		user_memories: [{ memory_id: "m1", memory_content: "hi" }],
 	} as unknown as SDK.ListV2SourceListResponse)
 	assert.deepEqual(direct.user_memories, [{ memory_id: "m1", memory_content: "hi" }])
 
 	// Fallback field names (id / title) when v2 records differ.
 	const fallback = toListMemoriesResponse({
-		inner: { sources: [{ id: "s1", title: "A title" }] },
+		user_memories: [{ id: "s1", title: "A title" }],
 	} as unknown as SDK.ListV2SourceListResponse)
 	assert.deepEqual(fallback.user_memories, [{ memory_id: "s1", memory_content: "A title" }])
 })
 
 test("toListSourcesResponse maps knowledge rows and total", () => {
+	// The live API returns knowledge sources at top-level `sources`/`total`.
 	const res = toListSourcesResponse({
-		inner: { sources: [{ id: "s1", title: "T", type: "pdf" }], total: 1 },
+		sources: [{ id: "s1", title: "T", type: "pdf" }],
+		total: 1,
 	} as unknown as SDK.ListV2SourceListResponse)
 	assert.equal(res.total, 1)
 	assert.equal(res.sources[0]!.id, "s1")
