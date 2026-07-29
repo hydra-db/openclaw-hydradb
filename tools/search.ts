@@ -4,7 +4,8 @@ import type { HydraClient } from "../client.ts"
 import type { HydraPluginConfig } from "../config.ts"
 import { buildRecalledContext } from "../context.ts"
 import { log } from "../log.ts"
-import type { VectorChunk } from "../types/hydra.ts"
+import { TOOL_NAMES } from "../tool-names.ts"
+import { registerToolWithAlias } from "./register.ts"
 
 
 export function registerSearchTool(
@@ -12,9 +13,9 @@ export function registerSearchTool(
 	client: HydraClient,
 	cfg: HydraPluginConfig,
 ): void {
-	api.registerTool(
+	registerToolWithAlias(
+		api,
 		{
-			name: "hydra_search",
 			label: "Hydra Search",
 			description:
 				"Search through Hydra DB memories. Returns relevant chunks with graph-enriched context.",
@@ -59,6 +60,7 @@ export function registerSearchTool(
 				}
 			},
 		},
-		{ name: "hydra_search" },
+		TOOL_NAMES.QUERY,
+		TOOL_NAMES.SEARCH,
 	)
 }

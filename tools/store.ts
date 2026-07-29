@@ -5,7 +5,9 @@ import type { HydraPluginConfig } from "../config.ts"
 import { log } from "../log.ts"
 import { extractAllTurns, filterIgnoredTurns } from "../messages.ts"
 import { toToolSourceId } from "../session.ts"
+import { TOOL_NAMES } from "../tool-names.ts"
 import type { ConversationTurn } from "../types/hydra.ts"
+import { registerToolWithAlias } from "./register.ts"
 
 const MAX_STORE_TURNS = 10
 
@@ -20,9 +22,9 @@ export function registerStoreTool(
 	getSessionId: () => string | undefined,
 	getMessages: () => unknown[],
 ): void {
-	api.registerTool(
+	registerToolWithAlias(
+		api,
 		{
-			name: "hydra_store",
 			label: "Hydra Store",
 			description:
 				"Save the full conversation history to Hydra DB memory. Use this to persist facts, preferences, or decisions the user wants remembered. The complete chat history will be sent for context-rich storage.",
@@ -111,6 +113,7 @@ export function registerStoreTool(
 				}
 			},
 		},
-		{ name: "hydra_store" },
+		TOOL_NAMES.INGEST,
+		TOOL_NAMES.STORE,
 	)
 }

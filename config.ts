@@ -2,6 +2,7 @@ export type HydraPluginConfig = {
 	apiKey: string
 	tenantId: string
 	subTenantId: string
+	baseUrl?: string
 	autoRecall: boolean
 	autoCapture: boolean
 	maxRecallResults: number
@@ -31,6 +32,38 @@ function envOrNull(name: string): string | undefined {
 	return typeof process !== "undefined" ? process.env[name] : undefined
 }
 
+// ── Environment variable aliasing (CONTRACT.md §1) ──
+//
+// Canonical prefix is `HYDRADB_`. OpenClaw additionally reads ONLY its own
+// historical `HYDRA_OPENCLAW_` prefix (per-client scoping: a client never reads
+// another client's legacy spelling). The canonical name wins if both are set; a
+// deprecated alias is honoured but emits exactly one stderr warning per process
+// naming its canonical replacement.
+
+const warnedEnvAliases = new Set<string>()
+
+function warnEnvAlias(deprecated: string, canonical: string): void {
+	if (warnedEnvAliases.has(deprecated)) return
+	warnedEnvAliases.add(deprecated)
+	console.error(
+		`[hydra-db] The environment variable ${deprecated} is deprecated; use ${canonical} instead.`,
+	)
+}
+
+/** Read the canonical env var, falling back to OpenClaw's deprecated alias(es) with a one-time warning. */
+function envWithAliases(canonical: string, deprecated: string[]): string | undefined {
+	const canon = envOrNull(canonical)
+	if (canon) return canon
+	for (const dep of deprecated) {
+		const value = envOrNull(dep)
+		if (value) {
+			warnEnvAlias(dep, canonical)
+			return value
+		}
+	}
+	return undefined
+}
+
 function resolveEnvVars(value: string): string {
 	return value.replace(/\$\{([^}]+)\}/g, (_, name: string) => {
 		const val = envOrNull(name)
@@ -53,34 +86,39 @@ export function parseConfig(raw: unknown): HydraPluginConfig {
 	const apiKey =
 		typeof cfg.apiKey === "string" && cfg.apiKey.length > 0
 			? resolveEnvVars(cfg.apiKey)
-			: envOrNull("HYDRA_OPENCLAW_API_KEY")
+			: envWithAliases("HYDRADB_API_KEY", ["HYDRA_OPENCLAW_API_KEY"])
 
 	if (!apiKey) {
 		throw new Error(
-			"hydra-db: apiKey is required — set it in plugin config or via HYDRA_OPENCLAW_API_KEY env var",
+			"hydra-db: apiKey is required — set it in plugin config or via the HYDRADB_API_KEY env var",
 		)
 	}
 
 	const tenantId =
 		typeof cfg.tenantId === "string" && cfg.tenantId.length > 0
 			? resolveEnvVars(cfg.tenantId)
-			: envOrNull("HYDRA_OPENCLAW_TENANT_ID")
+			: envWithAliases("HYDRADB_DATABASE", ["HYDRA_OPENCLAW_TENANT_ID"])
 
 	if (!tenantId) {
 		throw new Error(
-			"hydra-db: tenantId is required — set it in plugin config or via HYDRA_OPENCLAW_TENANT_ID env var",
+			"hydra-db: tenantId is required — set it in plugin config or via the HYDRADB_DATABASE env var",
 		)
 	}
 
 	const subTenantId =
 		typeof cfg.subTenantId === "string" && cfg.subTenantId.length > 0
 			? cfg.subTenantId
-			: DEFAULT_SUB_TENANT
+			: (envWithAliases("HYDRADB_COLLECTION", []) ?? DEFAULT_SUB_TENANT)
+
+	// Base URL is canonical-only: OpenClaw never shipped a legacy base-url env,
+	// and the SDK defaults to https://api.hydradb.com (the v1 endpoint) when unset.
+	const baseUrl = envWithAliases("HYDRADB_BASE_URL", [])
 
 	return {
 		apiKey,
 		tenantId,
 		subTenantId,
+		...(baseUrl ? { baseUrl } : {}),
 		autoRecall: (cfg.autoRecall as boolean) ?? true,
 		autoCapture: (cfg.autoCapture as boolean) ?? true,
 		maxRecallResults: (cfg.maxRecallResults as number) ?? 10,

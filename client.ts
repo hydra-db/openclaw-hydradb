@@ -1,19 +1,35 @@
+import {
+	toAddMemoryResponse,
+	toDeleteMemoryResponse,
+	toFetchContentResponse,
+	toListMemoriesResponse,
+	toListSourcesResponse,
+	toRecallResponse,
+} from "./adapters.ts"
+import { HydraDB } from "./hydra/index.ts"
 import { log } from "./log.ts"
 import type {
-	AddMemoryRequest,
 	AddMemoryResponse,
 	ConversationTurn,
 	DeleteMemoryResponse,
-	FetchContentRequest,
 	FetchContentResponse,
-	ListDataRequest,
 	ListMemoriesResponse,
 	ListSourcesResponse,
-	RecallRequest,
 	RecallResponse,
 } from "./types/hydra.ts"
 
-const API_BASE = "https://api.hydradb.com"
+/**
+ * OpenClaw's host-behaviour layer over the portable HydraDB wrapper (hydra/).
+ *
+ * PRO-1298: this class KEEPS its v1 public surface (`recall`, `ingestText`,
+ * `ingestConversation`, `listMemories`, `listSources`, `deleteMemory`,
+ * `fetchContent`, `getTenantId`, `getSubTenantId`) so every caller — the agent
+ * tools, slash commands, CLI and both hooks — is repointed at the wrapper
+ * WITHOUT touching a single call site. The transport underneath changed from the
+ * hand-rolled v1 `fetch` client to `@hydradb/sdk` via the wrapper; the behaviour
+ * (injected defaults, ingest instructions, response shapes, error regimes) did
+ * not. See CONTRACT.md §2 rule 5.
+ */
 
 const INGEST_INSTRUCTIONS =
 	"Focus on extracting user preferences, habits, opinions, likes, dislikes, " +
@@ -23,52 +39,29 @@ const INGEST_INSTRUCTIONS =
 	"so that it can be used to personalise future interactions."
 
 export class HydraClient {
-	private apiKey: string
 	private tenantId: string
 	private subTenantId: string
+	private hydra: HydraDB
 
-	constructor(apiKey: string, tenantId: string, subTenantId: string) {
-		this.apiKey = apiKey
+	constructor(
+		apiKey: string,
+		tenantId: string,
+		subTenantId: string,
+		baseUrl?: string,
+		// Test seam: inject a pre-built wrapper (e.g. over a mocked SDK transport).
+		hydra?: HydraDB,
+	) {
 		this.tenantId = tenantId
 		this.subTenantId = subTenantId
+		this.hydra =
+			hydra ??
+			new HydraDB({
+				token: apiKey,
+				database: tenantId,
+				collection: subTenantId,
+				...(baseUrl != null ? { baseUrl } : {}),
+			})
 		log.info(`connected (tenant=${tenantId}, sub=${subTenantId})`)
-	}
-
-	private headers(): Record<string, string> {
-		return {
-			Authorization: `Bearer ${this.apiKey}`,
-			"Content-Type": "application/json",
-		}
-	}
-
-	private async post<T>(path: string, body: unknown): Promise<T> {
-		const url = `${API_BASE}${path}`
-		log.debug("POST", path, body)
-		const res = await fetch(url, {
-			method: "POST",
-			headers: this.headers(),
-			body: JSON.stringify(body),
-		})
-		if (!res.ok) {
-			const text = await res.text().catch(() => "")
-			throw new Error(`Hydra ${path} → ${res.status}: ${text}`)
-		}
-		return res.json() as Promise<T>
-	}
-
-	private async del<T>(path: string, params: Record<string, string>): Promise<T> {
-		const qs = new URLSearchParams(params).toString()
-		const url = `${API_BASE}${path}?${qs}`
-		log.debug("DELETE", path, params)
-		const res = await fetch(url, {
-			method: "DELETE",
-			headers: this.headers(),
-		})
-		if (!res.ok) {
-			const text = await res.text().catch(() => "")
-			throw new Error(`Hydra ${path} → ${res.status}: ${text}`)
-		}
-		return res.json() as Promise<T>
 	}
 
 	// --- Ingest ---
@@ -81,24 +74,19 @@ export class HydraClient {
 			metadata?: Record<string, unknown>
 		},
 	): Promise<AddMemoryResponse> {
-		const payload: AddMemoryRequest = {
-			memories: [
-				{
-					user_assistant_pairs: turns,
-					infer: true,
-					source_id: sourceId,
-					user_name: opts?.userName ?? "User",
-					custom_instructions: INGEST_INSTRUCTIONS,
-					...(opts?.metadata && {
-						document_metadata: JSON.stringify(opts.metadata),
-					}),
-				},
-			],
-			tenant_id: this.tenantId,
-			sub_tenant_id: this.subTenantId,
+		const data = await this.hydra.context.ingest({
+			kind: "memory",
+			pairs: turns,
+			infer: true,
+			sourceId,
+			userName: opts?.userName ?? "User",
+			customInstructions: INGEST_INSTRUCTIONS,
 			upsert: true,
-		}
-		return this.post<AddMemoryResponse>("/memories/add_memory", payload)
+			...(opts?.metadata && {
+				documentMetadata: JSON.stringify(opts.metadata),
+			}),
+		})
+		return toAddMemoryResponse(data)
 	}
 
 	async ingestText(
@@ -112,24 +100,19 @@ export class HydraClient {
 		},
 	): Promise<AddMemoryResponse> {
 		const shouldInfer = opts?.infer ?? true
-		const payload: AddMemoryRequest = {
-			memories: [
-				{
-					text,
-					infer: shouldInfer,
-					is_markdown: opts?.isMarkdown ?? false,
-					...(shouldInfer && {
-						custom_instructions: opts?.customInstructions ?? INGEST_INSTRUCTIONS,
-					}),
-					...(opts?.sourceId && { source_id: opts.sourceId }),
-					...(opts?.title && { title: opts.title }),
-				},
-			],
-			tenant_id: this.tenantId,
-			sub_tenant_id: this.subTenantId,
+		const data = await this.hydra.context.ingest({
+			kind: "memory",
+			text,
+			infer: shouldInfer,
+			isMarkdown: opts?.isMarkdown ?? false,
+			...(shouldInfer && {
+				customInstructions: opts?.customInstructions ?? INGEST_INSTRUCTIONS,
+			}),
+			...(opts?.sourceId && { sourceId: opts.sourceId }),
+			...(opts?.title && { title: opts.title }),
 			upsert: true,
-		}
-		return this.post<AddMemoryResponse>("/memories/add_memory", payload)
+		})
+		return toAddMemoryResponse(data)
 	}
 
 	// --- Recall ---
@@ -143,48 +126,41 @@ export class HydraClient {
 			recencyBias?: number
 		},
 	): Promise<RecallResponse> {
-		const payload: RecallRequest = {
-			tenant_id: this.tenantId,
-			sub_tenant_id: this.subTenantId,
+		const data = await this.hydra.context.query({
 			query,
-			max_results: opts?.maxResults ?? 10,
+			kind: "memory",
+			maxResults: opts?.maxResults ?? 10,
 			mode: opts?.mode ?? "thinking",
 			alpha: 0.8,
-			recency_bias: opts?.recencyBias ?? 0,
-			graph_context: opts?.graphContext ?? true,
-		}
-		return this.post<RecallResponse>("/recall/recall_preferences", payload)
+			recencyBias: opts?.recencyBias ?? 0,
+			graphContext: opts?.graphContext ?? true,
+		})
+		return toRecallResponse(data)
 	}
 
 	// --- List ---
 
 	async listMemories(): Promise<ListMemoriesResponse> {
-		const payload: ListDataRequest = {
-			tenant_id: this.tenantId,
-			sub_tenant_id: this.subTenantId,
-			kind: "memories",
-		}
-		return this.post<ListMemoriesResponse>("/list/data", payload)
+		const data = await this.hydra.context.list({ kind: "memory" })
+		return toListMemoriesResponse(data)
 	}
 
 	async listSources(sourceIds?: string[]): Promise<ListSourcesResponse> {
-		const payload: ListDataRequest = {
-			tenant_id: this.tenantId,
-			sub_tenant_id: this.subTenantId,
+		const data = await this.hydra.context.list({
 			kind: "knowledge",
-			...(sourceIds && { source_ids: sourceIds }),
-		}
-		return this.post<ListSourcesResponse>("/list/data", payload)
+			...(sourceIds && { ids: sourceIds }),
+		})
+		return toListSourcesResponse(data)
 	}
 
 	// --- Delete ---
 
 	async deleteMemory(memoryId: string): Promise<DeleteMemoryResponse> {
-		return this.del<DeleteMemoryResponse>("/memories/delete_memory", {
-			tenant_id: this.tenantId,
-			memory_id: memoryId,
-			sub_tenant_id: this.subTenantId,
+		const data = await this.hydra.context.delete({
+			ids: [memoryId],
+			kind: "memory",
 		})
+		return toDeleteMemoryResponse(data)
 	}
 
 	// --- Fetch Content ---
@@ -193,13 +169,11 @@ export class HydraClient {
 		sourceId: string,
 		mode: "content" | "url" | "both" = "content",
 	): Promise<FetchContentResponse> {
-		const payload: FetchContentRequest = {
-			tenant_id: this.tenantId,
-			sub_tenant_id: this.subTenantId,
-			source_id: sourceId,
+		const data = await this.hydra.context.inspect({
+			id: sourceId,
 			mode,
-		}
-		return this.post<FetchContentResponse>("/fetch/content", payload)
+		})
+		return toFetchContentResponse(data)
 	}
 
 	// --- Accessors ---

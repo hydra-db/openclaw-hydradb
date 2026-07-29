@@ -3,15 +3,17 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk"
 import type { HydraClient } from "../client.ts"
 import type { HydraPluginConfig } from "../config.ts"
 import { log } from "../log.ts"
+import { TOOL_NAMES } from "../tool-names.ts"
+import { registerToolWithAlias } from "./register.ts"
 
 export function registerGetTool(
 	api: OpenClawPluginApi,
 	client: HydraClient,
 	_cfg: HydraPluginConfig,
 ): void {
-	api.registerTool(
+	registerToolWithAlias(
+		api,
 		{
-			name: "hydra_get_content",
 			label: "Hydra Get Content",
 			description:
 				"Fetch the full content of a specific source from Hydra by its source ID. Use this to retrieve the complete text of a memory source when you need more details than what's shown in search results.",
@@ -52,6 +54,7 @@ export function registerGetTool(
 				}
 			},
 		},
-		{ name: "hydra_get_content" },
+		TOOL_NAMES.INSPECT,
+		TOOL_NAMES.GET_CONTENT,
 	)
 }

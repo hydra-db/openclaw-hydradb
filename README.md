@@ -61,9 +61,13 @@ Two required values:
 Environment variables (recommended for secrets):
 
 ```bash
-export HYDRA_OPENCLAW_API_KEY="your-api-key"
-export HYDRA_OPENCLAW_TENANT_ID="your-tenant-id"
+export HYDRADB_API_KEY="your-api-key"
+export HYDRADB_DATABASE="your-database-id"
 ```
+
+> The legacy `HYDRA_OPENCLAW_API_KEY` / `HYDRA_OPENCLAW_TENANT_ID` variables are
+> still honoured but emit a one-time deprecation warning naming the canonical
+> `HYDRADB_*` replacement. The canonical name wins if both are set.
 
 Or configure directly in OpenClaw's settings file:
 
@@ -107,40 +111,54 @@ openclaw gateway restart
 
 ## How It Works
 
-- **Auto-Recall** — Before every AI turn, queries Hydra (`/recall/recall_preferences`) for relevant memories and injects graph-enriched context (entity paths, chunk relations, extra context).
-- **Auto-Capture** — After every AI turn, the last user/assistant exchange is sent to Hydra (`/memories/add_memory`) as conversation pairs with `infer: true` and `upsert: true`. The session ID is used as `source_id` so Hydra groups exchanges per session and builds a knowledge graph automatically.
+- **Auto-Recall** — Before every AI turn, queries Hydra for relevant memories and injects graph-enriched context (entity paths, chunk relations, extra context).
+- **Auto-Capture** — After every AI turn, the last user/assistant exchange is sent to Hydra as conversation pairs with `infer: true` and `upsert: true`. The session ID is used as `source_id` so Hydra groups exchanges per session and builds a knowledge graph automatically.
+
+All requests go through the generated `@hydradb/sdk` (v2 API), behind a thin
+hand-owned wrapper (`hydra/`) that owns the SDK at an exact pin — see
+[`CONTRACT.md`](./CONTRACT.md).
 
 ## Slash Commands
 
-| Command                     | Description                           |
-| --------------------------- | ------------------------------------- |
-| `/hydra-onboard`          | Show current configuration status     |
-| `/hydra-remember <text>` | Save something to Hydra memory       |
-| `/hydra-recall <query>`  | Search memories with relevance scores |
-| `/hydra-list`            | List all stored user memories         |
-| `/hydra-delete <id>`     | Delete a specific memory by its ID    |
-| `/hydra-get <source_id>` | Fetch the full content of a source    |
+The canonical `/hydradb-*` names are shown below. The previous `/hydra-*` names
+still work as **deprecated aliases** (each emits a one-time warning).
+
+| Command                       | Deprecated alias         | Description                           |
+| ----------------------------- | ------------------------ | ------------------------------------- |
+| `/hydradb-ingest <text>`   | `/hydra-remember`      | Save something to Hydra memory        |
+| `/hydradb-query <query>`   | `/hydra-recall`        | Search memories with relevance scores |
+| `/hydradb-list`            | `/hydra-list`          | List all stored user memories         |
+| `/hydradb-delete <id>`     | `/hydra-delete`        | Delete a specific memory by its ID    |
+| `/hydradb-inspect <source_id>` | `/hydra-get`       | Fetch the full content of a source    |
+| `/hydra-onboard`           | —                        | Show current configuration status     |
 
 ## AI Tools
 
-| Tool                   | Description |
-| ---------------------- | ----------- |
-| `hydra_store`         | Save the recent conversation history to Hydra as memory |
-| `hydra_search`        | Search Hydra memories (returns graph-enriched context) |
-| `hydra_list_memories` | List all stored user memories (IDs + summaries) |
-| `hydra_get_content`   | Fetch full content for a specific `source_id` |
-| `hydra_delete_memory` | Delete a memory by `memory_id` (use only when user explicitly asks) |
+The canonical `hydradb_*` names are shown below. The previous `hydra_*` names
+still work as **deprecated aliases** (each emits a one-time warning).
+
+| Tool               | Deprecated alias        | Description |
+| ------------------ | ----------------------- | ----------- |
+| `hydradb_ingest`  | `hydra_store`          | Save the recent conversation history to Hydra as memory |
+| `hydradb_query`   | `hydra_search`         | Search Hydra memories (returns graph-enriched context) |
+| `hydradb_list`    | `hydra_list_memories`  | List all stored user memories (IDs + summaries) |
+| `hydradb_inspect` | `hydra_get_content`    | Fetch full content for a specific `source_id` |
+| `hydradb_delete`  | `hydra_delete_memory`  | Delete a memory by `memory_id` (use only when user explicitly asks) |
 
 ## CLI
 
+The canonical root is `hydradb`. The previous `hydra <verb>` commands still work
+as **deprecated aliases** (each emits a one-time warning).
+
 ```bash
-openclaw hydra onboard             # Interactive onboarding wizard
-openclaw hydra onboard --advanced  # Advanced onboarding wizard
-openclaw hydra search <query>      # Search memories
-openclaw hydra list                # List all user memories
-openclaw hydra delete <id>         # Delete a memory
-openclaw hydra get <source_id>     # Fetch source content
-openclaw hydra status              # Show plugin configuration
+openclaw hydradb onboard             # Interactive onboarding wizard
+openclaw hydradb onboard --advanced  # Advanced onboarding wizard
+openclaw hydradb query <query>       # Search memories        (was: hydra search)
+openclaw hydradb ingest <text>       # Save a memory
+openclaw hydradb list                # List all user memories (was: hydra list)
+openclaw hydradb delete <id>         # Delete a memory        (was: hydra delete)
+openclaw hydradb inspect <source_id> # Fetch source content   (was: hydra get)
+openclaw hydradb status              # Show plugin configuration
 ```
 
 ## Troubleshooting

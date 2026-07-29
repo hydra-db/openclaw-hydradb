@@ -1,5 +1,6 @@
 node_modules/
-dist/
+dist/*
+!dist/index.mjs
 ignore/
 *.js.map
 .DS_Store
