@@ -90,7 +90,7 @@ test("unified ingest posts items[] as a JSON body", async () => {
 	const { fetch, calls } = fetchStub({ success: true, data: { success: true, success_count: 1, failed_count: 0 } })
 	const sdk = { context: { ingest() { throw new Error("SDK path must not be used") } } } as unknown as HydraDBClient
 	const hydra = new HydraDB({ token: "t", database: "db_u", collection: "c1", baseUrl: "https://api.test", fetch }, sdk)
-	await hydra.context.ingest({
+	const result = await hydra.context.ingest({
 		kind: "unified",
 		pairs: [{ user: "I prefer dark mode", assistant: "Noted" }],
 		sourceId: "chat-1",
@@ -100,6 +100,10 @@ test("unified ingest posts items[] as a JSON body", async () => {
 		documentMetadata: JSON.stringify({ source: "openclaw_hook" }),
 		upsert: true,
 	})
+	// The counts survive the raw path in the SDK's camelCase, so the host
+	// adapter reports them instead of zeros (Greptile on #26).
+	assert.equal(result.successCount, 1)
+	assert.equal(result.failedCount, 0)
 	assert.equal(calls.length, 1)
 	assert.equal(calls[0]!.url, "https://api.test/context/ingest")
 	assert.equal((calls[0]!.init.headers as Record<string, string>)["API-Version"], "2")
@@ -137,4 +141,18 @@ test("create with a layout posts type; layout() reads details and falls back to 
 	const failing = fetchStub({ success: false }, 500)
 	const broken = new HydraDB({ token: "t", database: "a", baseUrl: "https://api.test", fetch: failing.fetch }, {} as HydraDBClient)
 	assert.equal(await broken.databases.layout("a"), "split")
+})
+
+test("a raw failure keeps the status and body on the error", async () => {
+	const { fetch } = fetchStub({ success: false, error: { code: "VALIDATION_ERROR", message: "type=memory is not valid on a unified database" } }, 400)
+	const hydra = new HydraDB({ token: "t", database: "db_u", baseUrl: "https://api.test", fetch }, {} as HydraDBClient)
+	await assert.rejects(
+		() => hydra.databases.create({ database: "x", type: "unified" }),
+		(err: unknown) => {
+			assert.ok(err instanceof HydraWrapperError)
+			assert.equal(err.status, 400)
+			assert.match(err.message, /unified database/)
+			return true
+		},
+	)
 })

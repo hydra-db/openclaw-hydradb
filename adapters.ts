@@ -76,12 +76,22 @@ export function toRecallResponse(data: SDK.SearchV2RetrievalResult): RecallRespo
 export function toAddMemoryResponse(
 	data: SDK.IngestionV2SourceUploadResponse,
 ): AddMemoryResponse {
+	// Read both spellings: the SDK deserialises to camelCase, the raw unified
+	// ingest path (PRO-1618) is normalised to the same names but a wire-shaped
+	// payload must still count rather than read as zero.
+	const d = data as unknown as Record<string, unknown>
+	const num = (...keys: string[]): number => {
+		for (const key of keys) {
+			if (typeof d[key] === "number") return d[key] as number
+		}
+		return 0
+	}
 	return {
 		success: data.success ?? false,
 		message: data.message ?? "",
 		results: [],
-		success_count: data.successCount ?? 0,
-		failed_count: data.failedCount ?? 0,
+		success_count: num("successCount", "success_count"),
+		failed_count: num("failedCount", "failed_count"),
 	}
 }
 

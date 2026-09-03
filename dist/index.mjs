@@ -41,12 +41,19 @@ function toRecallResponse(data) {
   };
 }
 function toAddMemoryResponse(data) {
+  const d = data;
+  const num = (...keys) => {
+    for (const key of keys) {
+      if (typeof d[key] === "number") return d[key];
+    }
+    return 0;
+  };
   return {
     success: data.success ?? false,
     message: data.message ?? "",
     results: [],
-    success_count: data.successCount ?? 0,
-    failed_count: data.failedCount ?? 0
+    success_count: num("successCount", "success_count"),
+    failed_count: num("failedCount", "failed_count")
   };
 }
 function str(record, ...keys) {
@@ -214,7 +221,10 @@ var RawHttp = class {
       }
       if (!response.ok) {
         const detail = parsed && typeof parsed === "object" ? JSON.stringify(parsed) : String(parsed ?? "");
-        throw new HydraWrapperError(`Hydra DB ${path2} \u2192 ${response.status}: ${detail}`, path2);
+        throw new HydraWrapperError(`Hydra DB ${path2} \u2192 ${response.status}: ${detail}`, path2, {
+          status: response.status,
+          body: parsed
+        });
       }
       return unwrap(parsed);
     } catch (err) {
@@ -359,14 +369,20 @@ var ContextResource = class extends Resource {
       items: [item],
       ...params.upsert != null ? { upsert: params.upsert } : {}
     };
-    return this.call(
-      "/context/ingest",
-      () => this.requireRaw("unified ingest").request(
+    return this.call("/context/ingest", async () => {
+      const wire = await this.requireRaw("unified ingest").request(
         "POST",
         "/context/ingest",
         body
-      )
-    );
+      );
+      return {
+        success: wire.success,
+        message: wire.message,
+        successCount: wire.success_count ?? wire.successCount,
+        failedCount: wire.failed_count ?? wire.failedCount,
+        results: wire.results
+      };
+    });
   }
   /** List memories or knowledge sources (SDK `context.list`). */
   list(params = {}) {

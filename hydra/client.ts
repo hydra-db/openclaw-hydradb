@@ -293,13 +293,23 @@ export class ContextResource extends Resource {
 			items: [item],
 			...(params.upsert != null ? { upsert: params.upsert } : {}),
 		}
-		return this.call("/context/ingest", () =>
-			this.requireRaw("unified ingest").request<SDK.IngestionV2SourceUploadResponse>(
+		return this.call("/context/ingest", async () => {
+			// The raw path hands back the wire's snake_case; the SDK path hands
+			// back camelCase, and every adapter reads the latter. Normalise here
+			// so a unified ingest reports its counts instead of zeros.
+			const wire = await this.requireRaw("unified ingest").request<Record<string, unknown>>(
 				"POST",
 				"/context/ingest",
 				body,
-			),
-		)
+			)
+			return {
+				success: wire.success,
+				message: wire.message,
+				successCount: wire.success_count ?? wire.successCount,
+				failedCount: wire.failed_count ?? wire.failedCount,
+				results: wire.results,
+			} as SDK.IngestionV2SourceUploadResponse
+		})
 	}
 
 	/** List memories or knowledge sources (SDK `context.list`). */

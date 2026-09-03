@@ -61,7 +61,10 @@ export class RawHttp {
 					parsed && typeof parsed === "object"
 						? JSON.stringify(parsed)
 						: String(parsed ?? "")
-				throw new HydraWrapperError(`Hydra DB ${path} → ${response.status}: ${detail}`, path)
+				throw new HydraWrapperError(`Hydra DB ${path} → ${response.status}: ${detail}`, path, {
+					status: response.status,
+					body: parsed,
+				})
 			}
 			return unwrap<T>(parsed)
 		} catch (err) {
