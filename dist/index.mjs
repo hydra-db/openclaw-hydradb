@@ -187,18 +187,36 @@ function translateError(path2, err) {
 
 // hydra/raw.ts
 var DEFAULT_BASE_URL = "https://api.hydradb.com";
+var RETRY_STATUSES = /* @__PURE__ */ new Set([408, 429, 500, 502, 503, 504]);
 var RawHttp = class {
   constructor(config) {
     this.config = config;
     this.baseUrl = (config.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, "");
     this.timeoutMs = config.timeoutMs ?? 3e4;
     this.fetchImpl = config.fetch ?? fetch;
+    this.maxRetries = config.maxRetries ?? 2;
   }
   config;
   baseUrl;
   timeoutMs;
   fetchImpl;
+  maxRetries;
+  /** Same retry tolerance the SDK gives every call: 429/5xx and network failures, short backoff. */
   async request(method, path2, body) {
+    let lastErr;
+    for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+      try {
+        return await this.once(method, path2, body);
+      } catch (err) {
+        lastErr = err;
+        const retryable = err instanceof HydraWrapperError && (err.status == null || RETRY_STATUSES.has(err.status));
+        if (!retryable || attempt === this.maxRetries) throw err;
+        await new Promise((resolve) => setTimeout(resolve, Math.min(250 * 2 ** attempt, 2e3)));
+      }
+    }
+    throw lastErr;
+  }
+  async once(method, path2, body) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
     try {
@@ -717,10 +735,31 @@ var HydraClient = class {
     }
     return this.kindPromise;
   }
+  /**
+   * Run one call with the resolved kind. If the kind came from a probe that
+   * could not tell (it failed, or the database was not in the list it saw)
+   * and the server answers with the rule ("type 'memory' is not valid on a
+   * unified database"), that answer IS the layout: pin it and retry once as
+   * `unified`. A pinned `layout` setting is never second-guessed.
+   */
+  async withKind(run) {
+    const kind = await this.kind();
+    try {
+      return await run(kind);
+    } catch (err) {
+      const refused = err instanceof HydraWrapperError && err.status === 400 && /unified database/i.test(err.message);
+      if (refused && kind !== "unified" && this.layoutSetting === "auto") {
+        log.warn("[hydra] the database is unified; switching every call to kind unified");
+        this.kindPromise = Promise.resolve("unified");
+        return run("unified");
+      }
+      throw err;
+    }
+  }
   // --- Ingest ---
   async ingestConversation(turns, sourceId, opts) {
-    const data = await this.hydra.context.ingest({
-      kind: await this.kind(),
+    const data = await this.withKind((kind) => this.hydra.context.ingest({
+      kind,
       pairs: turns,
       infer: true,
       sourceId,
@@ -730,13 +769,13 @@ var HydraClient = class {
       ...opts?.metadata && {
         documentMetadata: JSON.stringify(opts.metadata)
       }
-    });
+    }));
     return toAddMemoryResponse(data);
   }
   async ingestText(text, opts) {
     const shouldInfer = opts?.infer ?? true;
-    const data = await this.hydra.context.ingest({
-      kind: await this.kind(),
+    const data = await this.withKind((kind) => this.hydra.context.ingest({
+      kind,
       text,
       infer: shouldInfer,
       isMarkdown: opts?.isMarkdown ?? false,
@@ -746,25 +785,25 @@ var HydraClient = class {
       ...opts?.sourceId && { sourceId: opts.sourceId },
       ...opts?.title && { title: opts.title },
       upsert: true
-    });
+    }));
     return toAddMemoryResponse(data);
   }
   // --- Recall ---
   async recall(query, opts) {
-    const data = await this.hydra.context.query({
+    const data = await this.withKind((kind) => this.hydra.context.query({
       query,
-      kind: await this.kind(),
+      kind,
       maxResults: opts?.maxResults ?? 10,
       mode: opts?.mode ?? "thinking",
       alpha: 0.8,
       recencyBias: opts?.recencyBias ?? 0,
       graphContext: opts?.graphContext ?? true
-    });
+    }));
     return toRecallResponse(data);
   }
   // --- List ---
   async listMemories() {
-    const data = await this.hydra.context.list({ kind: await this.kind() });
+    const data = await this.withKind((kind) => this.hydra.context.list({ kind }));
     return toListMemoriesResponse(data);
   }
   async listSources(sourceIds) {
@@ -776,10 +815,10 @@ var HydraClient = class {
   }
   // --- Delete ---
   async deleteMemory(memoryId) {
-    const data = await this.hydra.context.delete({
+    const data = await this.withKind((kind) => this.hydra.context.delete({
       ids: [memoryId],
-      kind: await this.kind()
-    });
+      kind
+    }));
     return toDeleteMemoryResponse(data);
   }
   // --- Fetch Content ---

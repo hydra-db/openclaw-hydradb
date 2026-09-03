@@ -6,7 +6,7 @@ import {
 	toListSourcesResponse,
 	toRecallResponse,
 } from "./adapters.ts"
-import { HydraDB } from "./hydra/index.ts"
+import { HydraDB, HydraWrapperError } from "./hydra/index.ts"
 import type { ContextKind, Layout } from "./hydra/index.ts"
 import { log } from "./log.ts"
 import type {
@@ -95,6 +95,29 @@ export class HydraClient {
 		return this.kindPromise
 	}
 
+	/**
+	 * Run one call with the resolved kind. If the kind came from a probe that
+	 * could not tell (it failed, or the database was not in the list it saw)
+	 * and the server answers with the rule ("type 'memory' is not valid on a
+	 * unified database"), that answer IS the layout: pin it and retry once as
+	 * `unified`. A pinned `layout` setting is never second-guessed.
+	 */
+	private async withKind<T>(run: (kind: ContextKind) => Promise<T>): Promise<T> {
+		const kind = await this.kind()
+		try {
+			return await run(kind)
+		} catch (err) {
+			const refused =
+				err instanceof HydraWrapperError && err.status === 400 && /unified database/i.test(err.message)
+			if (refused && kind !== "unified" && this.layoutSetting === "auto") {
+				log.warn("[hydra] the database is unified; switching every call to kind unified")
+				this.kindPromise = Promise.resolve<ContextKind>("unified")
+				return run("unified")
+			}
+			throw err
+		}
+	}
+
 	// --- Ingest ---
 
 	async ingestConversation(
@@ -105,8 +128,8 @@ export class HydraClient {
 			metadata?: Record<string, unknown>
 		},
 	): Promise<AddMemoryResponse> {
-		const data = await this.hydra.context.ingest({
-			kind: await this.kind(),
+		const data = await this.withKind((kind) => this.hydra.context.ingest({
+			kind,
 			pairs: turns,
 			infer: true,
 			sourceId,
@@ -116,7 +139,7 @@ export class HydraClient {
 			...(opts?.metadata && {
 				documentMetadata: JSON.stringify(opts.metadata),
 			}),
-		})
+		}))
 		return toAddMemoryResponse(data)
 	}
 
@@ -131,8 +154,8 @@ export class HydraClient {
 		},
 	): Promise<AddMemoryResponse> {
 		const shouldInfer = opts?.infer ?? true
-		const data = await this.hydra.context.ingest({
-			kind: await this.kind(),
+		const data = await this.withKind((kind) => this.hydra.context.ingest({
+			kind,
 			text,
 			infer: shouldInfer,
 			isMarkdown: opts?.isMarkdown ?? false,
@@ -142,7 +165,7 @@ export class HydraClient {
 			...(opts?.sourceId && { sourceId: opts.sourceId }),
 			...(opts?.title && { title: opts.title }),
 			upsert: true,
-		})
+		}))
 		return toAddMemoryResponse(data)
 	}
 
@@ -157,22 +180,22 @@ export class HydraClient {
 			recencyBias?: number
 		},
 	): Promise<RecallResponse> {
-		const data = await this.hydra.context.query({
+		const data = await this.withKind((kind) => this.hydra.context.query({
 			query,
-			kind: await this.kind(),
+			kind,
 			maxResults: opts?.maxResults ?? 10,
 			mode: opts?.mode ?? "thinking",
 			alpha: 0.8,
 			recencyBias: opts?.recencyBias ?? 0,
 			graphContext: opts?.graphContext ?? true,
-		})
+		}))
 		return toRecallResponse(data)
 	}
 
 	// --- List ---
 
 	async listMemories(): Promise<ListMemoriesResponse> {
-		const data = await this.hydra.context.list({ kind: await this.kind() })
+		const data = await this.withKind((kind) => this.hydra.context.list({ kind }))
 		return toListMemoriesResponse(data)
 	}
 
@@ -187,10 +210,10 @@ export class HydraClient {
 	// --- Delete ---
 
 	async deleteMemory(memoryId: string): Promise<DeleteMemoryResponse> {
-		const data = await this.hydra.context.delete({
+		const data = await this.withKind((kind) => this.hydra.context.delete({
 			ids: [memoryId],
-			kind: await this.kind(),
-		})
+			kind,
+		}))
 		return toDeleteMemoryResponse(data)
 	}
 
