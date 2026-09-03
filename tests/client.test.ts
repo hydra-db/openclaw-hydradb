@@ -155,3 +155,68 @@ test("HydraClient exposes tenant/collection accessors", () => {
 	assert.equal(client.getTenantId(), "tenant-a")
 	assert.equal(client.getSubTenantId(), "sub-a")
 })
+
+// PRO-1618: on a unified database the server refuses `memory`, so every call
+// the host layer makes must carry `unified` there and `memory` on a split one.
+function mockClientWithLayout(
+	layout: "split" | "unified",
+	setting: "auto" | "split" | "unified" = "auto",
+): { client: HydraClient; calls: Recorded[] } {
+	const calls: Recorded[] = []
+	const record = (method: string) => (args: Record<string, unknown>) => {
+		calls.push({ method, args })
+		return Promise.resolve({})
+	}
+	const hydra = {
+		context: {
+			ingest: record("ingest"),
+			query: record("query"),
+			list: record("list"),
+			delete: record("delete"),
+		},
+		databases: { layout: () => Promise.resolve(layout) },
+	} as unknown as HydraDB
+	return { client: new HydraClient("k", "tenant-a", "sub-a", undefined, hydra, setting), calls }
+}
+
+test("auto layout: a unified database makes every call send kind unified", async () => {
+	const { client, calls } = mockClientWithLayout("unified")
+	await client.recall("q")
+	await client.ingestText("note")
+	await client.ingestConversation([{ user: "a", assistant: "b" }], "s1")
+	await client.listMemories()
+	await client.deleteMemory("m1")
+	assert.deepEqual(
+		calls.map((c) => [c.method, c.args.kind]),
+		[["query", "unified"], ["ingest", "unified"], ["ingest", "unified"], ["list", "unified"], ["delete", "unified"]],
+	)
+})
+
+test("auto layout: a split database keeps sending kind memory", async () => {
+	const { client, calls } = mockClientWithLayout("split")
+	await client.recall("q")
+	await client.ingestText("note")
+	assert.deepEqual(calls.map((c) => c.args.kind), ["memory", "memory"])
+})
+
+test("a pinned layout skips the probe", async () => {
+	const { client, calls } = mockClientWithLayout("split", "unified")
+	await client.recall("q")
+	assert.equal(calls[0]!.args.kind, "unified")
+})
+
+test("listMemories reads the source shape a unified list returns", async () => {
+	const calls: Recorded[] = []
+	const hydra = {
+		context: {
+			list: (args: Record<string, unknown>) => {
+				calls.push({ method: "list", args })
+				return Promise.resolve({ sources: [{ id: "doc-1", title: "Ledger notes" }], total: 1 })
+			},
+		},
+		databases: { layout: () => Promise.resolve("unified") },
+	} as unknown as HydraDB
+	const client = new HydraClient("k", "tenant-a", "sub-a", undefined, hydra)
+	const res = await client.listMemories()
+	assert.deepEqual(res.user_memories, [{ memory_id: "doc-1", memory_content: "Ledger notes" }])
+})

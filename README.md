@@ -108,8 +108,11 @@ openclaw gateway restart
 | `graphContext`     | `boolean` | `true`              | Include knowledge graph relations in recalled context                          |
 | `ignoreTerm`       | `string`  | `"hydra-ignore"`    | Messages containing this term are excluded from recall & capture              |
 | `debug`            | `boolean` | `false`             | Verbose debug logs                                                             |
+| `layout`           | `string`  | `"auto"`            | Storage layout of the database: `auto` reads it from Hydra once; `unified` (one corpus, created with `type: "unified"`) or `split` pin it |
 
 ## How It Works
+
+- **Unified databases** (PRO-1618): a database created with `type: "unified"` keeps knowledge and memory in one corpus and refuses `type: memory`. With `layout: "auto"` the plugin reads the layout from `GET /databases` once and sends `unified` there, ingesting through the `items[]` shape; on a split database nothing changes.
 
 - **Auto-Recall** — Before every AI turn, queries Hydra for relevant memories and injects graph-enriched context (entity paths, chunk relations, extra context).
 - **Auto-Capture** — After every AI turn, the last user/assistant exchange is sent to Hydra as conversation pairs with `infer: true` and `upsert: true`. The session ID is used as `source_id` so Hydra groups exchanges per session and builds a knowledge graph automatically.

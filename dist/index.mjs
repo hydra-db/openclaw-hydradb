@@ -61,12 +61,13 @@ function asRecords(value) {
 }
 function toListMemoriesResponse(data) {
   const d = data;
-  const records = asRecords(d.user_memories) ?? asRecords(d.inner?.user_memories) ?? [];
+  const inner = d.inner;
+  const records = asRecords(d.user_memories) ?? asRecords(inner?.user_memories) ?? asRecords(d.sources) ?? asRecords(inner?.sources) ?? [];
   return {
     success: true,
     user_memories: records.map((record) => ({
       memory_id: str(record, "memory_id", "id", "source_id") ?? "",
-      memory_content: str(record, "memory_content", "content", "text", "memory", "title") ?? ""
+      memory_content: str(record, "memory_content", "content", "text", "memory", "title", "description") ?? ""
     }))
   };
 }
@@ -176,6 +177,56 @@ function translateError(path2, err) {
   });
 }
 
+// hydra/raw.ts
+var DEFAULT_BASE_URL = "https://api.hydradb.com";
+var RawHttp = class {
+  constructor(config) {
+    this.config = config;
+    this.baseUrl = (config.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, "");
+    this.timeoutMs = config.timeoutMs ?? 3e4;
+    this.fetchImpl = config.fetch ?? fetch;
+  }
+  config;
+  baseUrl;
+  timeoutMs;
+  fetchImpl;
+  async request(method, path2, body) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    try {
+      const response = await this.fetchImpl(`${this.baseUrl}${path2}`, {
+        method,
+        headers: {
+          Authorization: `Bearer ${this.config.token}`,
+          "Content-Type": "application/json",
+          // CONTRACT §2 rule 6: every v2 call names its version.
+          "API-Version": "2"
+        },
+        ...body !== void 0 ? { body: JSON.stringify(body) } : {},
+        signal: controller.signal
+      });
+      const text = await response.text();
+      let parsed;
+      try {
+        parsed = text === "" ? null : JSON.parse(text);
+      } catch {
+        parsed = text;
+      }
+      if (!response.ok) {
+        const detail = parsed && typeof parsed === "object" ? JSON.stringify(parsed) : String(parsed ?? "");
+        throw new HydraWrapperError(`Hydra DB ${path2} \u2192 ${response.status}: ${detail}`, path2);
+      }
+      return unwrap(parsed);
+    } catch (err) {
+      if (err instanceof HydraWrapperError) throw err;
+      const reason = err instanceof Error && err.name === "AbortError" ? `timed out after ${this.timeoutMs}ms` : err instanceof Error ? err.message : String(err);
+      throw new HydraWrapperError(`Hydra DB ${path2} \u2192 ERR: ${reason}`, path2, { cause: err });
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+};
+
 // hydra/client.ts
 function kindToType(kind) {
   return kind;
@@ -189,6 +240,18 @@ var Resource = class {
   sdk;
   database;
   collection;
+  /** Hand-rolled v2 transport for calls the pinned SDK cannot make; see ./raw.ts. */
+  raw;
+  /** @internal */
+  attachRaw(raw) {
+    this.raw = raw;
+  }
+  requireRaw(what) {
+    if (!this.raw) {
+      throw new Error(`${what} needs the v2 transport, which this HydraDB instance was built without`);
+    }
+    return this.raw;
+  }
   scope(override) {
     const collection = override ?? this.collection;
     return collection != null ? { database: this.database, collection } : { database: this.database };
@@ -224,6 +287,7 @@ var ContextResource = class extends Resource {
   }
   /** Ingest a memory or knowledge item (SDK `context.ingest`, multipart). */
   ingest(params) {
+    if (params.kind === "unified") return this.ingestUnified(params);
     const request = {
       ...this.scope(params.collection),
       type: kindToType(params.kind)
@@ -261,6 +325,48 @@ var ContextResource = class extends Resource {
       }
     }
     return this.call("/context/ingest", () => this.sdk.context.ingest(request));
+  }
+  /**
+   * The unified ingest shape (PRO-1618): one `items[]` array, each item text or
+   * a conversation, no corpus selector, sent as the JSON body of
+   * `POST /context/ingest`. On a split database the items land in its memory
+   * corpus, so a caller that has not created a unified database sees no change.
+   */
+  ingestUnified(params) {
+    const item = {};
+    if (params.text != null) item.text = params.text;
+    if (params.pairs != null) {
+      item.conversation = params.pairs.flatMap((turn) => [
+        { role: "user", content: turn.user, ...params.userName ? { name: params.userName } : {} },
+        { role: "assistant", content: turn.assistant }
+      ]);
+    }
+    if (params.sourceId != null) item.context_id = params.sourceId;
+    if (params.title != null) item.title = params.title;
+    item.enrich = params.infer ?? true;
+    if (item.enrich && params.customInstructions != null) {
+      item.custom_instructions = params.customInstructions;
+    }
+    if (params.documentMetadata != null) {
+      try {
+        item.custom_attributes = JSON.parse(params.documentMetadata);
+      } catch {
+        item.custom_attributes = { document_metadata: params.documentMetadata };
+      }
+    }
+    const body = {
+      ...this.scope(params.collection),
+      items: [item],
+      ...params.upsert != null ? { upsert: params.upsert } : {}
+    };
+    return this.call(
+      "/context/ingest",
+      () => this.requireRaw("unified ingest").request(
+        "POST",
+        "/context/ingest",
+        body
+      )
+    );
   }
   /** List memories or knowledge sources (SDK `context.list`). */
   list(params = {}) {
@@ -327,6 +433,21 @@ var DatabasesResource = class extends Resource {
     super(sdk, database, collection);
   }
   create(params) {
+    if (params.type != null) {
+      return this.call(
+        "/databases",
+        () => this.requireRaw("database create with a layout").request(
+          "POST",
+          "/databases",
+          {
+            database: params.database,
+            type: params.type,
+            ...params.databaseMetadataSchema != null ? { database_metadata_schema: params.databaseMetadataSchema } : {},
+            ...params.embeddingsDimension != null ? { embeddings_dimension: params.embeddingsDimension } : {}
+          }
+        )
+      );
+    }
     return this.call(
       "/databases",
       () => this.sdk.databases.create({
@@ -341,6 +462,39 @@ var DatabasesResource = class extends Resource {
   }
   list() {
     return this.call("/databases", () => this.sdk.databases.list());
+  }
+  layoutCache;
+  /**
+   * Every database this key can see, with its storage layout (PRO-1618), from
+   * `GET /databases` `details[]`. Memoised for the process: a layout is fixed
+   * at creation, so it cannot go stale.
+   */
+  layouts() {
+    if (!this.layoutCache) {
+      this.layoutCache = this.requireRaw("layout probe").request("GET", "/databases").then((listed) => {
+        const map = /* @__PURE__ */ new Map();
+        for (const row of listed.details ?? []) {
+          if (row.database) map.set(row.database, row.type === "unified" ? "unified" : "split");
+        }
+        return map;
+      }).catch((err) => {
+        this.layoutCache = void 0;
+        throw err;
+      });
+    }
+    return this.layoutCache;
+  }
+  /**
+   * The layout of one database. Unknown, or a failed probe, reads as `split`,
+   * which every database created before PRO-1618 is: the worst case is the old
+   * default, never a wrong unified call.
+   */
+  async layout(database) {
+    try {
+      return (await this.layouts()).get(database) ?? "split";
+    } catch {
+      return "split";
+    }
   }
   collections(database) {
     return this.call(
@@ -376,6 +530,9 @@ var HydraDB = class {
       config.database,
       config.collection
     );
+    const raw = new RawHttp({ token: config.token, baseUrl: config.baseUrl, fetch: config.fetch });
+    this.context.attachRaw(raw);
+    this.databases.attachRaw(raw);
   }
 };
 
@@ -421,9 +578,12 @@ var HydraClient = class {
   tenantId;
   subTenantId;
   hydra;
-  constructor(apiKey, tenantId, subTenantId, baseUrl, hydra) {
+  layoutSetting;
+  kindPromise;
+  constructor(apiKey, tenantId, subTenantId, baseUrl, hydra, layout = "auto") {
     this.tenantId = tenantId;
     this.subTenantId = subTenantId;
+    this.layoutSetting = layout;
     this.hydra = hydra ?? new HydraDB({
       token: apiKey,
       database: tenantId,
@@ -432,10 +592,22 @@ var HydraClient = class {
     });
     log.info(`connected (tenant=${tenantId}, sub=${subTenantId})`);
   }
+  /**
+   * The kind every call sends (PRO-1618). A unified database refuses
+   * `memory`, so on one the plugin sends `unified`; on a split database
+   * (every database created before) it keeps sending `memory`, exactly as
+   * before. Resolved once per process; a failed probe reads as split.
+   */
+  kind() {
+    if (!this.kindPromise) {
+      this.kindPromise = this.layoutSetting === "auto" ? Promise.resolve().then(() => this.hydra.databases.layout(this.tenantId)).then((layout) => layout === "unified" ? "unified" : "memory").catch(() => "memory") : Promise.resolve(this.layoutSetting === "unified" ? "unified" : "memory");
+    }
+    return this.kindPromise;
+  }
   // --- Ingest ---
   async ingestConversation(turns, sourceId, opts) {
     const data = await this.hydra.context.ingest({
-      kind: "memory",
+      kind: await this.kind(),
       pairs: turns,
       infer: true,
       sourceId,
@@ -451,7 +623,7 @@ var HydraClient = class {
   async ingestText(text, opts) {
     const shouldInfer = opts?.infer ?? true;
     const data = await this.hydra.context.ingest({
-      kind: "memory",
+      kind: await this.kind(),
       text,
       infer: shouldInfer,
       isMarkdown: opts?.isMarkdown ?? false,
@@ -468,7 +640,7 @@ var HydraClient = class {
   async recall(query, opts) {
     const data = await this.hydra.context.query({
       query,
-      kind: "memory",
+      kind: await this.kind(),
       maxResults: opts?.maxResults ?? 10,
       mode: opts?.mode ?? "thinking",
       alpha: 0.8,
@@ -479,7 +651,7 @@ var HydraClient = class {
   }
   // --- List ---
   async listMemories() {
-    const data = await this.hydra.context.list({ kind: "memory" });
+    const data = await this.hydra.context.list({ kind: await this.kind() });
     return toListMemoriesResponse(data);
   }
   async listSources(sourceIds) {
@@ -493,7 +665,7 @@ var HydraClient = class {
   async deleteMemory(memoryId) {
     const data = await this.hydra.context.delete({
       ids: [memoryId],
-      kind: "memory"
+      kind: await this.kind()
     });
     return toDeleteMemoryResponse(data);
   }
@@ -1125,7 +1297,8 @@ var KNOWN_KEYS = /* @__PURE__ */ new Set([
   "recallMode",
   "graphContext",
   "ignoreTerm",
-  "debug"
+  "debug",
+  "layout"
 ]);
 var DEFAULT_SUB_TENANT = "hydra-openclaw-plugin";
 var DEFAULT_IGNORE_TERM = "hydra-ignore";
@@ -1190,8 +1363,14 @@ function parseConfig(raw) {
     recallMode: cfg.recallMode === "thinking" ? "thinking" : "fast",
     graphContext: cfg.graphContext ?? true,
     ignoreTerm: typeof cfg.ignoreTerm === "string" && cfg.ignoreTerm.length > 0 ? cfg.ignoreTerm : DEFAULT_IGNORE_TERM,
-    debug: cfg.debug ?? false
+    debug: cfg.debug ?? false,
+    layout: parseLayout(cfg.layout)
   };
+}
+function parseLayout(value) {
+  if (value === void 0) return "auto";
+  if (value === "split" || value === "unified" || value === "auto") return value;
+  throw new Error(`hydra-db: layout must be "split", "unified" or "auto"`);
 }
 function tryParseConfig(raw) {
   try {
@@ -1820,7 +1999,7 @@ var index_default = {
   configSchema: hydraConfigSchema,
   register(api) {
     const cfg = tryParseConfig(api.pluginConfig);
-    const cliClient = cfg ? new HydraClient(cfg.apiKey, cfg.tenantId, cfg.subTenantId, cfg.baseUrl) : null;
+    const cliClient = cfg ? new HydraClient(cfg.apiKey, cfg.tenantId, cfg.subTenantId, cfg.baseUrl, void 0, cfg.layout) : null;
     api.registerCli(
       ({ program }) => {
         const canonicalRoot = program.command("hydradb").description("Hydra DB memory commands");
@@ -1844,7 +2023,7 @@ var index_default = {
       return;
     }
     log.init(api.logger, cfg.debug);
-    const client = new HydraClient(cfg.apiKey, cfg.tenantId, cfg.subTenantId, cfg.baseUrl);
+    const client = new HydraClient(cfg.apiKey, cfg.tenantId, cfg.subTenantId, cfg.baseUrl, void 0, cfg.layout);
     let activeSessionId;
     let conversationMessages = [];
     const getSessionId = () => activeSessionId;

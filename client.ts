@@ -7,6 +7,7 @@ import {
 	toRecallResponse,
 } from "./adapters.ts"
 import { HydraDB } from "./hydra/index.ts"
+import type { ContextKind, Layout } from "./hydra/index.ts"
 import { log } from "./log.ts"
 import type {
 	AddMemoryResponse,
@@ -38,10 +39,15 @@ const INGEST_INSTRUCTIONS =
 	"name, age, email ids, phone numbers, etc. along with the original name and context " +
 	"so that it can be used to personalise future interactions."
 
+/** How the plugin decides which corpus kind to send (PRO-1618). */
+export type LayoutSetting = Layout | "auto"
+
 export class HydraClient {
 	private tenantId: string
 	private subTenantId: string
 	private hydra: HydraDB
+	private layoutSetting: LayoutSetting
+	private kindPromise?: Promise<ContextKind>
 
 	constructor(
 		apiKey: string,
@@ -50,9 +56,12 @@ export class HydraClient {
 		baseUrl?: string,
 		// Test seam: inject a pre-built wrapper (e.g. over a mocked SDK transport).
 		hydra?: HydraDB,
+		// `auto` reads the database's layout once; `split`/`unified` pin it.
+		layout: LayoutSetting = "auto",
 	) {
 		this.tenantId = tenantId
 		this.subTenantId = subTenantId
+		this.layoutSetting = layout
 		this.hydra =
 			hydra ??
 			new HydraDB({
@@ -62,6 +71,28 @@ export class HydraClient {
 				...(baseUrl != null ? { baseUrl } : {}),
 			})
 		log.info(`connected (tenant=${tenantId}, sub=${subTenantId})`)
+	}
+
+	/**
+	 * The kind every call sends (PRO-1618). A unified database refuses
+	 * `memory`, so on one the plugin sends `unified`; on a split database
+	 * (every database created before) it keeps sending `memory`, exactly as
+	 * before. Resolved once per process; a failed probe reads as split.
+	 */
+	private kind(): Promise<ContextKind> {
+		if (!this.kindPromise) {
+			this.kindPromise =
+				this.layoutSetting === "auto"
+					? Promise.resolve()
+							// Deferred so a wrapper without a databases resource (a
+							// test seam) resolves to the split default instead of
+							// throwing synchronously out of the first call.
+							.then(() => this.hydra.databases.layout(this.tenantId))
+							.then((layout): ContextKind => (layout === "unified" ? "unified" : "memory"))
+							.catch((): ContextKind => "memory")
+					: Promise.resolve<ContextKind>(this.layoutSetting === "unified" ? "unified" : "memory")
+		}
+		return this.kindPromise
 	}
 
 	// --- Ingest ---
@@ -75,7 +106,7 @@ export class HydraClient {
 		},
 	): Promise<AddMemoryResponse> {
 		const data = await this.hydra.context.ingest({
-			kind: "memory",
+			kind: await this.kind(),
 			pairs: turns,
 			infer: true,
 			sourceId,
@@ -101,7 +132,7 @@ export class HydraClient {
 	): Promise<AddMemoryResponse> {
 		const shouldInfer = opts?.infer ?? true
 		const data = await this.hydra.context.ingest({
-			kind: "memory",
+			kind: await this.kind(),
 			text,
 			infer: shouldInfer,
 			isMarkdown: opts?.isMarkdown ?? false,
@@ -128,7 +159,7 @@ export class HydraClient {
 	): Promise<RecallResponse> {
 		const data = await this.hydra.context.query({
 			query,
-			kind: "memory",
+			kind: await this.kind(),
 			maxResults: opts?.maxResults ?? 10,
 			mode: opts?.mode ?? "thinking",
 			alpha: 0.8,
@@ -141,7 +172,7 @@ export class HydraClient {
 	// --- List ---
 
 	async listMemories(): Promise<ListMemoriesResponse> {
-		const data = await this.hydra.context.list({ kind: "memory" })
+		const data = await this.hydra.context.list({ kind: await this.kind() })
 		return toListMemoriesResponse(data)
 	}
 
@@ -158,7 +189,7 @@ export class HydraClient {
 	async deleteMemory(memoryId: string): Promise<DeleteMemoryResponse> {
 		const data = await this.hydra.context.delete({
 			ids: [memoryId],
-			kind: "memory",
+			kind: await this.kind(),
 		})
 		return toDeleteMemoryResponse(data)
 	}

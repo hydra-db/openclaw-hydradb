@@ -28,11 +28,25 @@ import type { HydraDB as SDK } from "@hydradb/sdk"
 
 import { unwrap } from "./envelope.ts"
 import { translateError } from "./errors.ts"
+import { type Layout, RawHttp } from "./raw.ts"
 
-export type ContextKind = "memory" | "knowledge"
+export type { Layout } from "./raw.ts"
 
-function kindToType(kind: ContextKind | undefined): "memory" | "knowledge" | undefined {
-	return kind
+/**
+ * `unified` (PRO-1618) names the ONE corpus of a database created with
+ * `type: "unified"`. On such a database it is the only accepted value (and the
+ * server default); on a split database it is refused, exactly as
+ * `memory`/`knowledge` are refused on a unified one. `databases.layout()` tells
+ * the two apart.
+ */
+export type ContextKind = "memory" | "knowledge" | "unified"
+
+/**
+ * The SDK's enums predate `unified`; the value is a plain string on the wire,
+ * so it is passed through with a cast rather than dropped.
+ */
+function kindToType<T extends string>(kind: ContextKind | undefined): T | undefined {
+	return kind as T | undefined
 }
 
 export interface HydraConfig {
@@ -44,6 +58,8 @@ export interface HydraConfig {
 	collection?: string
 	/** Optional base URL override; defaults to the SDK's environment. */
 	baseUrl?: string
+	/** Test seam for the hand-rolled v2 calls (see ./raw.ts); production uses global fetch. */
+	fetch?: typeof fetch
 }
 
 export interface QueryParams {
@@ -125,6 +141,8 @@ export interface DeleteParams {
 
 export interface CreateDatabaseParams {
 	database: string
+	/** Storage layout (PRO-1618). Omitted means `split`, the layout every existing database has. */
+	type?: Layout
 	databaseMetadataSchema?: SDK.TenantsCustomPropertyDefinition[]
 	embeddingsDimension?: number
 }
@@ -132,6 +150,21 @@ export interface CreateDatabaseParams {
 type ScopeFields = { database: string; collection?: string }
 
 abstract class Resource {
+	/** Hand-rolled v2 transport for calls the pinned SDK cannot make; see ./raw.ts. */
+	protected raw?: RawHttp
+
+	/** @internal */
+	attachRaw(raw: RawHttp): void {
+		this.raw = raw
+	}
+
+	protected requireRaw(what: string): RawHttp {
+		if (!this.raw) {
+			throw new Error(`${what} needs the v2 transport, which this HydraDB instance was built without`)
+		}
+		return this.raw
+	}
+
 	protected constructor(
 		protected readonly sdk: HydraDBClient,
 		private readonly database: string,
@@ -178,6 +211,7 @@ export class ContextResource extends Resource {
 
 	/** Ingest a memory or knowledge item (SDK `context.ingest`, multipart). */
 	ingest(params: IngestParams): Promise<SDK.IngestionV2SourceUploadResponse> {
+		if (params.kind === "unified") return this.ingestUnified(params)
 		const request: SDK.IngestContextRequest = {
 			...this.scope(params.collection),
 			type: kindToType(params.kind),
@@ -222,6 +256,50 @@ export class ContextResource extends Resource {
 		}
 
 		return this.call("/context/ingest", () => this.sdk.context.ingest(request))
+	}
+
+	/**
+	 * The unified ingest shape (PRO-1618): one `items[]` array, each item text or
+	 * a conversation, no corpus selector, sent as the JSON body of
+	 * `POST /context/ingest`. On a split database the items land in its memory
+	 * corpus, so a caller that has not created a unified database sees no change.
+	 */
+	private ingestUnified(params: IngestParams): Promise<SDK.IngestionV2SourceUploadResponse> {
+		const item: Record<string, unknown> = {}
+		if (params.text != null) item.text = params.text
+		if (params.pairs != null) {
+			item.conversation = params.pairs.flatMap((turn) => [
+				{ role: "user", content: turn.user, ...(params.userName ? { name: params.userName } : {}) },
+				{ role: "assistant", content: turn.assistant },
+			])
+		}
+		if (params.sourceId != null) item.context_id = params.sourceId
+		if (params.title != null) item.title = params.title
+		item.enrich = params.infer ?? true
+		if (item.enrich && params.customInstructions != null) {
+			item.custom_instructions = params.customInstructions
+		}
+		if (params.documentMetadata != null) {
+			// The split path carries this as a pre-serialised JSON string; the
+			// unified item takes the object itself.
+			try {
+				item.custom_attributes = JSON.parse(params.documentMetadata)
+			} catch {
+				item.custom_attributes = { document_metadata: params.documentMetadata }
+			}
+		}
+		const body = {
+			...this.scope(params.collection),
+			items: [item],
+			...(params.upsert != null ? { upsert: params.upsert } : {}),
+		}
+		return this.call("/context/ingest", () =>
+			this.requireRaw("unified ingest").request<SDK.IngestionV2SourceUploadResponse>(
+				"POST",
+				"/context/ingest",
+				body,
+			),
+		)
 	}
 
 	/** List memories or knowledge sources (SDK `context.list`). */
@@ -296,6 +374,26 @@ export class DatabasesResource extends Resource {
 	create(
 		params: CreateDatabaseParams,
 	): Promise<SDK.TenantsTenantCreateAcceptedResponse> {
+		if (params.type != null) {
+			// The pinned SDK's create request has no `type`; its serializer would
+			// drop it and provision a split database in silence.
+			return this.call("/databases", () =>
+				this.requireRaw("database create with a layout").request<SDK.TenantsTenantCreateAcceptedResponse>(
+					"POST",
+					"/databases",
+					{
+						database: params.database,
+						type: params.type,
+						...(params.databaseMetadataSchema != null
+							? { database_metadata_schema: params.databaseMetadataSchema }
+							: {}),
+						...(params.embeddingsDimension != null
+							? { embeddings_dimension: params.embeddingsDimension }
+							: {}),
+					},
+				),
+			)
+		}
 		return this.call("/databases", () =>
 			this.sdk.databases.create({
 				database: params.database,
@@ -311,6 +409,45 @@ export class DatabasesResource extends Resource {
 
 	list(): Promise<SDK.TenantsTenantIdsResponse> {
 		return this.call("/databases", () => this.sdk.databases.list())
+	}
+
+	private layoutCache?: Promise<Map<string, Layout>>
+
+	/**
+	 * Every database this key can see, with its storage layout (PRO-1618), from
+	 * `GET /databases` `details[]`. Memoised for the process: a layout is fixed
+	 * at creation, so it cannot go stale.
+	 */
+	layouts(): Promise<Map<string, Layout>> {
+		if (!this.layoutCache) {
+			this.layoutCache = this.requireRaw("layout probe")
+				.request<{ details?: { database?: string; type?: string }[] }>("GET", "/databases")
+				.then((listed) => {
+					const map = new Map<string, Layout>()
+					for (const row of listed.details ?? []) {
+						if (row.database) map.set(row.database, row.type === "unified" ? "unified" : "split")
+					}
+					return map
+				})
+				.catch((err) => {
+					this.layoutCache = undefined
+					throw err
+				})
+		}
+		return this.layoutCache
+	}
+
+	/**
+	 * The layout of one database. Unknown, or a failed probe, reads as `split`,
+	 * which every database created before PRO-1618 is: the worst case is the old
+	 * default, never a wrong unified call.
+	 */
+	async layout(database: string): Promise<Layout> {
+		try {
+			return (await this.layouts()).get(database) ?? "split"
+		} catch {
+			return "split"
+		}
 	}
 
 	collections(database: string): Promise<SDK.TenantsSubTenantIdsResponse> {
@@ -355,5 +492,8 @@ export class HydraDB {
 			config.database,
 			config.collection,
 		)
+		const raw = new RawHttp({ token: config.token, baseUrl: config.baseUrl, fetch: config.fetch })
+		this.context.attachRaw(raw)
+		this.databases.attachRaw(raw)
 	}
 }

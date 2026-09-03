@@ -29,6 +29,7 @@ that churn from reaching users. It is the reason we pin the SDK **exactly**, nev
 | **context** | the stored-unit family (memory + knowledge) | — |
 | **memory** | a context item of kind `memory` | user memory, preference |
 | **knowledge** | a context item of kind `knowledge` | document, file, source-as-kind |
+| **unified** | the one kind of a database created with `type: "unified"` (PRO-1618); the only kind such a database accepts, and its default. Clients read the layout from `GET /databases` `details[]` and default to it there | — |
 | **source** | one ingested item; its identifier field is `id` | source_id, file_id, doc_id |
 | **chunk** | one retrieved fragment of a source | — |
 

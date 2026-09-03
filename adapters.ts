@@ -104,16 +104,21 @@ export function toListMemoriesResponse(
 	// Memories surface at top-level `user_memories` — not under an `.inner`
 	// wrapper, and not under `sources` (that is the knowledge shape).
 	const d = data as unknown as Record<string, unknown>
+	const inner = d.inner as Record<string, unknown> | undefined
+	// A unified database (PRO-1618) lists every item in the SOURCE shape
+	// (`sources`), so that is read when no memory rows are present.
 	const records =
 		asRecords(d.user_memories) ??
-		asRecords((d.inner as Record<string, unknown> | undefined)?.user_memories) ??
+		asRecords(inner?.user_memories) ??
+		asRecords(d.sources) ??
+		asRecords(inner?.sources) ??
 		[]
 	return {
 		success: true,
 		user_memories: records.map((record) => ({
 			memory_id: str(record, "memory_id", "id", "source_id") ?? "",
 			memory_content:
-				str(record, "memory_content", "content", "text", "memory", "title") ?? "",
+				str(record, "memory_content", "content", "text", "memory", "title", "description") ?? "",
 		})),
 	}
 }
