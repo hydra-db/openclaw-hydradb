@@ -23,7 +23,7 @@
  */
 
 import { Buffer } from "node:buffer"
-import { HydraDBClient } from "@hydradb/sdk"
+import { HydraDBClient, serialization } from "@hydradb/sdk"
 import type { HydraDB as SDK } from "@hydradb/sdk"
 
 import { unwrap } from "./envelope.ts"
@@ -149,6 +149,32 @@ export interface CreateDatabaseParams {
 
 type ScopeFields = { database: string; collection?: string }
 
+/** The options the generated client itself passes to every response parser. */
+type SdkParseOptions = NonNullable<
+	Parameters<typeof serialization.SearchV2RetrievalResult.parseOrThrow>[1]
+>
+const SDK_PARSE_OPTS: SdkParseOptions = {
+	unrecognizedObjectKeys: "passthrough",
+	allowUnrecognizedUnionMembers: true,
+	allowUnrecognizedEnumValues: true,
+	skipValidation: true,
+	breadcrumbsPrefix: ["response"],
+}
+
+/** Drop undefined values so a hand-built wire body carries only what was said. */
+function compact(record: Record<string, unknown>): Record<string, unknown> {
+	const out: Record<string, unknown> = {}
+	for (const [k, v] of Object.entries(record)) if (v !== undefined) out[k] = v
+	return out
+}
+
+function queryString(record: Record<string, string | number | undefined>): string {
+	const params = new URLSearchParams()
+	for (const [k, v] of Object.entries(record)) if (v !== undefined) params.set(k, String(v))
+	const encoded = params.toString()
+	return encoded === "" ? "" : `?${encoded}`
+}
+
 abstract class Resource {
 	/** Hand-rolled v2 transport for calls the pinned SDK cannot make; see ./raw.ts. */
 	protected raw?: RawHttp
@@ -163,6 +189,23 @@ abstract class Resource {
 			throw new Error(`${what} needs the v2 transport, which this HydraDB instance was built without`)
 		}
 		return this.raw
+	}
+
+	/**
+	 * A raw v2 call whose wire result is run through the SDK's OWN response
+	 * serializer, so the caller gets the same camelCase object the SDK path
+	 * returns. Used for `kind: "unified"` (PRO-1618): the pinned SDK's REQUEST
+	 * serializers reject that enum value before anything is sent.
+	 */
+	protected async rawTyped<T>(
+		what: string,
+		method: "GET" | "POST" | "DELETE",
+		path: string,
+		body: unknown,
+		parse: (raw: unknown, opts?: SdkParseOptions) => T,
+	): Promise<T> {
+		const wire = await this.requireRaw(what).request<unknown>(method, path, body)
+		return parse(wire, SDK_PARSE_OPTS)
 	}
 
 	protected constructor(
@@ -194,6 +237,27 @@ export class ContextResource extends Resource {
 
 	/** The single retrieval entry point (SDK `client.query`). */
 	query(params: QueryParams): Promise<SDK.SearchV2RetrievalResult> {
+		if (params.kind === "unified") {
+			return this.call("/query", () =>
+				this.rawTyped(
+					"unified query",
+					"POST",
+					"/query",
+					compact({
+						...this.scope(params.collection),
+						query: params.query,
+						type: "unified",
+						operator: params.operator,
+						max_results: params.maxResults,
+						mode: params.mode,
+						graph_context: params.graphContext,
+						alpha: params.alpha,
+						recency_bias: params.recencyBias,
+					}),
+					serialization.SearchV2RetrievalResult.parseOrThrow,
+				),
+			)
+		}
 		return this.call("/query", () =>
 			this.sdk.query({
 				...this.scope(params.collection),
@@ -293,27 +357,36 @@ export class ContextResource extends Resource {
 			items: [item],
 			...(params.upsert != null ? { upsert: params.upsert } : {}),
 		}
-		return this.call("/context/ingest", async () => {
-			// The raw path hands back the wire's snake_case; the SDK path hands
-			// back camelCase, and every adapter reads the latter. Normalise here
-			// so a unified ingest reports its counts instead of zeros.
-			const wire = await this.requireRaw("unified ingest").request<Record<string, unknown>>(
+		return this.call("/context/ingest", () =>
+			this.rawTyped(
+				"unified ingest",
 				"POST",
 				"/context/ingest",
 				body,
-			)
-			return {
-				success: wire.success,
-				message: wire.message,
-				successCount: wire.success_count ?? wire.successCount,
-				failedCount: wire.failed_count ?? wire.failedCount,
-				results: wire.results,
-			} as SDK.IngestionV2SourceUploadResponse
-		})
+				serialization.IngestionV2SourceUploadResponse.parseOrThrow,
+			),
+		)
 	}
 
 	/** List memories or knowledge sources (SDK `context.list`). */
 	list(params: ListParams = {}): Promise<SDK.ListV2SourceListResponse> {
+		if (params.kind === "unified") {
+			return this.call("/context/list", () =>
+				this.rawTyped(
+					"unified list",
+					"POST",
+					"/context/list",
+					compact({
+						...this.scope(params.collection),
+						type: "unified",
+						ids: params.ids,
+						page: params.page,
+						page_size: params.pageSize,
+					}),
+					serialization.ListV2SourceListResponse.parseOrThrow,
+				),
+			)
+		}
 		return this.call("/context/list", () =>
 			this.sdk.context.list({
 				...this.scope(params.collection),
@@ -353,6 +426,25 @@ export class ContextResource extends Resource {
 	relations(
 		params: RelationsParams = {},
 	): Promise<SDK.GraphGraphRelationsResponse> {
+		if (params.kind === "unified") {
+			const scope = this.scope(params.collection)
+			return this.call("/context/relations", () =>
+				this.rawTyped(
+					"unified relations",
+					"GET",
+					`/context/relations${queryString({
+						database: scope.database,
+						collection: scope.collection,
+						id: params.id,
+						type: "unified",
+						limit: params.limit,
+						cursor: params.cursor,
+					})}`,
+					undefined,
+					serialization.GraphGraphRelationsResponse.parseOrThrow,
+				),
+			)
+		}
 		return this.call("/context/relations", () =>
 			this.sdk.context.relations({
 				...this.scope(params.collection),
@@ -366,6 +458,17 @@ export class ContextResource extends Resource {
 
 	/** Delete memories or knowledge sources (SDK `context.delete`). */
 	delete(params: DeleteParams): Promise<SDK.SourcesMemoryDeleteResponse> {
+		if (params.kind === "unified") {
+			return this.call("/context", () =>
+				this.rawTyped(
+					"unified delete",
+					"DELETE",
+					"/context",
+					compact({ ...this.scope(params.collection), ids: params.ids, type: "unified" }),
+					serialization.SourcesMemoryDeleteResponse.parseOrThrow,
+				),
+			)
+		}
 		return this.call("/context", () =>
 			this.sdk.context.delete({
 				...this.scope(params.collection),

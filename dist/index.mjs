@@ -123,7 +123,7 @@ function toFetchContentResponse(data) {
 
 // hydra/client.ts
 import { Buffer } from "node:buffer";
-import { HydraDBClient } from "@hydradb/sdk";
+import { HydraDBClient, serialization } from "@hydradb/sdk";
 
 // hydra/envelope.ts
 function isEnvelope(value) {
@@ -242,6 +242,24 @@ var RawHttp = class {
 function kindToType(kind) {
   return kind;
 }
+var SDK_PARSE_OPTS = {
+  unrecognizedObjectKeys: "passthrough",
+  allowUnrecognizedUnionMembers: true,
+  allowUnrecognizedEnumValues: true,
+  skipValidation: true,
+  breadcrumbsPrefix: ["response"]
+};
+function compact(record) {
+  const out = {};
+  for (const [k, v] of Object.entries(record)) if (v !== void 0) out[k] = v;
+  return out;
+}
+function queryString(record) {
+  const params = new URLSearchParams();
+  for (const [k, v] of Object.entries(record)) if (v !== void 0) params.set(k, String(v));
+  const encoded = params.toString();
+  return encoded === "" ? "" : `?${encoded}`;
+}
 var Resource = class {
   constructor(sdk, database, collection) {
     this.sdk = sdk;
@@ -263,6 +281,16 @@ var Resource = class {
     }
     return this.raw;
   }
+  /**
+   * A raw v2 call whose wire result is run through the SDK's OWN response
+   * serializer, so the caller gets the same camelCase object the SDK path
+   * returns. Used for `kind: "unified"` (PRO-1618): the pinned SDK's REQUEST
+   * serializers reject that enum value before anything is sent.
+   */
+  async rawTyped(what, method, path2, body, parse) {
+    const wire = await this.requireRaw(what).request(method, path2, body);
+    return parse(wire, SDK_PARSE_OPTS);
+  }
   scope(override) {
     const collection = override ?? this.collection;
     return collection != null ? { database: this.database, collection } : { database: this.database };
@@ -281,6 +309,28 @@ var ContextResource = class extends Resource {
   }
   /** The single retrieval entry point (SDK `client.query`). */
   query(params) {
+    if (params.kind === "unified") {
+      return this.call(
+        "/query",
+        () => this.rawTyped(
+          "unified query",
+          "POST",
+          "/query",
+          compact({
+            ...this.scope(params.collection),
+            query: params.query,
+            type: "unified",
+            operator: params.operator,
+            max_results: params.maxResults,
+            mode: params.mode,
+            graph_context: params.graphContext,
+            alpha: params.alpha,
+            recency_bias: params.recencyBias
+          }),
+          serialization.SearchV2RetrievalResult.parseOrThrow
+        )
+      );
+    }
     return this.call(
       "/query",
       () => this.sdk.query({
@@ -370,23 +420,37 @@ var ContextResource = class extends Resource {
       items: [item],
       ...params.upsert != null ? { upsert: params.upsert } : {}
     };
-    return this.call("/context/ingest", async () => {
-      const wire = await this.requireRaw("unified ingest").request(
+    return this.call(
+      "/context/ingest",
+      () => this.rawTyped(
+        "unified ingest",
         "POST",
         "/context/ingest",
-        body
-      );
-      return {
-        success: wire.success,
-        message: wire.message,
-        successCount: wire.success_count ?? wire.successCount,
-        failedCount: wire.failed_count ?? wire.failedCount,
-        results: wire.results
-      };
-    });
+        body,
+        serialization.IngestionV2SourceUploadResponse.parseOrThrow
+      )
+    );
   }
   /** List memories or knowledge sources (SDK `context.list`). */
   list(params = {}) {
+    if (params.kind === "unified") {
+      return this.call(
+        "/context/list",
+        () => this.rawTyped(
+          "unified list",
+          "POST",
+          "/context/list",
+          compact({
+            ...this.scope(params.collection),
+            type: "unified",
+            ids: params.ids,
+            page: params.page,
+            page_size: params.pageSize
+          }),
+          serialization.ListV2SourceListResponse.parseOrThrow
+        )
+      );
+    }
     return this.call(
       "/context/list",
       () => this.sdk.context.list({
@@ -422,6 +486,26 @@ var ContextResource = class extends Resource {
   }
   /** Knowledge-graph relations (SDK `context.relations`). */
   relations(params = {}) {
+    if (params.kind === "unified") {
+      const scope = this.scope(params.collection);
+      return this.call(
+        "/context/relations",
+        () => this.rawTyped(
+          "unified relations",
+          "GET",
+          `/context/relations${queryString({
+            database: scope.database,
+            collection: scope.collection,
+            id: params.id,
+            type: "unified",
+            limit: params.limit,
+            cursor: params.cursor
+          })}`,
+          void 0,
+          serialization.GraphGraphRelationsResponse.parseOrThrow
+        )
+      );
+    }
     return this.call(
       "/context/relations",
       () => this.sdk.context.relations({
@@ -435,6 +519,18 @@ var ContextResource = class extends Resource {
   }
   /** Delete memories or knowledge sources (SDK `context.delete`). */
   delete(params) {
+    if (params.kind === "unified") {
+      return this.call(
+        "/context",
+        () => this.rawTyped(
+          "unified delete",
+          "DELETE",
+          "/context",
+          compact({ ...this.scope(params.collection), ids: params.ids, type: "unified" }),
+          serialization.SourcesMemoryDeleteResponse.parseOrThrow
+        )
+      );
+    }
     return this.call(
       "/context",
       () => this.sdk.context.delete({

@@ -156,3 +156,45 @@ test("a raw failure keeps the status and body on the error", async () => {
 		},
 	)
 })
+
+// The pinned SDK's REQUEST serializers reject `type: "unified"` before anything
+// is sent, so unified reads and deletes are built by hand and their results
+// parsed with the SDK's own response serializer (same camelCase either way).
+test("unified query, list and delete bypass the SDK request serializers and return SDK-shaped results", async () => {
+	const answers: Record<string, unknown> = {
+		"/query": { chunks: [{ chunk_uuid: "c1", id: "s1", chunk_content: "body", relevancy_score: 0.9 }], sources: [] },
+		"/context/list": { sources: [{ id: "s1", title: "T" }], total: 1 },
+		"/context": { success: true, deleted_count: 1, user_memory_deleted: 1, results: [] },
+	}
+	const calls: { url: string; init: RequestInit }[] = []
+	const fetchImpl = ((url: string | URL | Request, init?: RequestInit) => {
+		const path = new URL(String(url)).pathname
+		calls.push({ url: String(url), init: init ?? {} })
+		return Promise.resolve(
+			new Response(JSON.stringify({ success: true, data: answers[path] }), { status: 200, headers: { "content-type": "application/json" } }),
+		)
+	}) as typeof fetch
+	const sdk = {
+		query() { throw new Error("SDK query must not be used for unified") },
+		context: {
+			list() { throw new Error("SDK list must not be used for unified") },
+			delete() { throw new Error("SDK delete must not be used for unified") },
+		},
+	} as unknown as HydraDBClient
+	const hydra = new HydraDB({ token: "t", database: "db_u", collection: "c1", baseUrl: "https://api.test", fetch: fetchImpl }, sdk)
+
+	const q = await hydra.context.query({ query: "acme", kind: "unified", maxResults: 5, mode: "thinking", alpha: 0.8 })
+	assert.equal(q.chunks?.[0]?.chunkContent, "body")
+	assert.deepEqual(JSON.parse(String(calls[0]!.init.body)), {
+		database: "db_u", collection: "c1", query: "acme", type: "unified", max_results: 5, mode: "thinking", alpha: 0.8,
+	})
+
+	const l = await hydra.context.list({ kind: "unified" })
+	assert.equal((l as unknown as { sources: { id: string }[] }).sources[0]?.id, "s1")
+	assert.deepEqual(JSON.parse(String(calls[1]!.init.body)), { database: "db_u", collection: "c1", type: "unified" })
+
+	const d = await hydra.context.delete({ ids: ["a"], kind: "unified" })
+	assert.equal(d.deletedCount, 1)
+	assert.equal(calls[2]!.init.method, "DELETE")
+	assert.deepEqual(JSON.parse(String(calls[2]!.init.body)), { database: "db_u", collection: "c1", ids: ["a"], type: "unified" })
+})
