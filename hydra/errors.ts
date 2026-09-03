@@ -62,6 +62,9 @@ function bodyToString(body: unknown): string {
  * the byte-identical `Hydra ${path} → ${status}: ${body}` message.
  */
 export function translateError(path: string, err: unknown): HydraWrapperError {
+	// Already ours (the raw v2 transport builds these with status and body):
+	// re-wrapping would drop exactly the fields a caller branches on.
+	if (err instanceof HydraWrapperError) return err
 	if (err instanceof HydraDBError) {
 		const status = err.statusCode
 		const statusText = status != null ? String(status) : "ERR"

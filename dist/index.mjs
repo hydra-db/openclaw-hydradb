@@ -169,6 +169,7 @@ function bodyToString(body) {
   }
 }
 function translateError(path2, err) {
+  if (err instanceof HydraWrapperError) return err;
   if (err instanceof HydraDBError) {
     const status = err.statusCode;
     const statusText = status != null ? String(status) : "ERR";
