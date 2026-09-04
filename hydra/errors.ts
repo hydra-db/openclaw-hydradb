@@ -57,13 +57,15 @@ export class HydraWrapperError extends Error {
 export const CORPUS_TYPE_UNSUPPORTED_CODE = "CORPUS_TYPE_UNSUPPORTED"
 
 /**
- * The two siblings under that code, excluded first. Both name a unified
- * database while telling you this one is SPLIT, or that the value is wrong
- * whatever the layout; retrying either as unified turns a clear 400 into a
- * second, more confusing one.
+ * The siblings under that code, excluded first: `unified` sent to a SPLIT
+ * database, `all` on an ingest, and a `type` outside the vocabulary entirely.
+ * All three name a unified database or a bad value rather than answering "this
+ * database is unified", and retrying any of them as unified turns a clear 400
+ * into a second, more confusing one. `invalid type` covers both the syntax
+ * refusal and the `all`-on-ingest one, which share that opening.
  */
 const OTHER_CORPUS_REFUSAL_RE =
-	/only valid on a unified database|only supported on a unified database|invalid type ['"]all['"]/i
+	/only valid on a unified database|only supported on a unified database|invalid type/i
 
 /**
  * The wording of the refusal that IS ours, for a server that sends no code (an
@@ -77,11 +79,16 @@ const OTHER_CORPUS_REFUSAL_RE =
  */
 const UNIFIED_LAYOUT_REFUSAL_RE = /is not valid on a unified database|this database is unified/i
 
+/**
+ * The v2 error envelope carries the code at `error.code` and repeats it at
+ * `detail.error_code`; some responses put it at the top level.
+ */
 function errorCodeOf(body: unknown): string | undefined {
 	if (!body || typeof body !== "object") return undefined
 	const record = body as Record<string, unknown>
 	const nested = record.error as Record<string, unknown> | undefined
-	const code = nested?.code ?? record.code ?? record.error_code
+	const detail = record.detail as Record<string, unknown> | undefined
+	const code = nested?.code ?? detail?.error_code ?? record.code ?? record.error_code
 	return typeof code === "string" && code !== "" ? code : undefined
 }
 

@@ -160,13 +160,14 @@ var HydraWrapperError = class _HydraWrapperError extends Error {
   }
 };
 var CORPUS_TYPE_UNSUPPORTED_CODE = "CORPUS_TYPE_UNSUPPORTED";
-var OTHER_CORPUS_REFUSAL_RE = /only valid on a unified database|only supported on a unified database|invalid type ['"]all['"]/i;
+var OTHER_CORPUS_REFUSAL_RE = /only valid on a unified database|only supported on a unified database|invalid type/i;
 var UNIFIED_LAYOUT_REFUSAL_RE = /is not valid on a unified database|this database is unified/i;
 function errorCodeOf(body) {
   if (!body || typeof body !== "object") return void 0;
   const record = body;
   const nested = record.error;
-  const code = nested?.code ?? record.code ?? record.error_code;
+  const detail = record.detail;
+  const code = nested?.code ?? detail?.error_code ?? record.code ?? record.error_code;
   return typeof code === "string" && code !== "" ? code : void 0;
 }
 function isUnifiedLayoutRefusal(err) {

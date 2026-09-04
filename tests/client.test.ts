@@ -338,3 +338,51 @@ test("a split database refusing `unified` is not retried, despite the same code"
 	await assert.rejects(() => client.recall("q"), /only valid on a unified database/)
 	assert.deepEqual(kinds, ["memory"], "no retry: this is the sibling refusal, not ours")
 })
+
+// The same code also covers `all` on an ingest and a `type` outside the
+// vocabulary, so keying on the code alone would have retried a typo as unified.
+test("a type outside the vocabulary is not a layout answer", async () => {
+	const kinds: unknown[] = []
+	const hydra = {
+		context: {
+			query: (args: Record<string, unknown>) => {
+				kinds.push(args.kind)
+				return Promise.reject(
+					new HydraWrapperError(
+						`Hydra /query → 400: invalid type "momory": must be 'knowledge', 'memory', 'unified' or 'all'`,
+						"/query",
+						{ status: 400, body: { detail: { error_code: "CORPUS_TYPE_UNSUPPORTED" } } },
+					),
+				)
+			},
+		},
+		databases: { layout: () => Promise.reject(new Error("probe failed")) },
+	} as unknown as HydraDB
+	const client = new HydraClient("k", "tenant-a", "sub-a", undefined, hydra)
+	await assert.rejects(() => client.recall("q"), /invalid type/)
+	assert.deepEqual(kinds, ["memory"], "no retry: a bad value is not a layout answer")
+})
+
+// The code is read from `detail.error_code` as well as `error.code`, and it
+// carries a refusal whose wording the regex cannot see.
+test("the code alone can trigger the retry when the wording is unfamiliar", async () => {
+	const kinds: unknown[] = []
+	const hydra = {
+		context: {
+			query: (args: Record<string, unknown>) => {
+				kinds.push(args.kind)
+				if (args.kind === "unified") return Promise.resolve({ chunks: [] })
+				return Promise.reject(
+					new HydraWrapperError("Hydra /query → 400: the corpus refused this request", "/query", {
+						status: 400,
+						body: { detail: { error_code: "CORPUS_TYPE_UNSUPPORTED" } },
+					}),
+				)
+			},
+		},
+		databases: { layout: () => Promise.reject(new Error("probe failed")) },
+	} as unknown as HydraDB
+	const client = new HydraClient("k", "tenant-a", "sub-a", undefined, hydra)
+	await client.recall("q")
+	assert.deepEqual(kinds, ["memory", "unified"])
+})
