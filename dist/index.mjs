@@ -160,7 +160,7 @@ var HydraWrapperError = class _HydraWrapperError extends Error {
   }
 };
 var CORPUS_TYPE_UNSUPPORTED_CODE = "CORPUS_TYPE_UNSUPPORTED";
-var OTHER_CORPUS_REFUSAL_RE = /only valid on a unified database|only supported on a unified database|invalid type/i;
+var OTHER_CORPUS_REFUSAL_RE = /only valid on a unified database|only supported on a unified database|invalid type|items cannot be combined with/i;
 var UNIFIED_LAYOUT_REFUSAL_RE = /is not valid on a unified database|this database is unified/i;
 function errorCodeOf(body) {
   if (!body || typeof body !== "object") return void 0;

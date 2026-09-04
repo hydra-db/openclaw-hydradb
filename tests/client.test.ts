@@ -386,3 +386,31 @@ test("the code alone can trigger the retry when the wording is unfamiliar", asyn
 	await client.recall("q")
 	assert.deepEqual(kinds, ["memory", "unified"])
 })
+
+// The `all`-on-ingest advice is layout-aware and now says "This database is
+// unified, so send 'unified'…" inside a refusal that is NOT ours. Excluding on
+// `invalid type` BEFORE reading the code is what keeps that sentence from being
+// read as a layout answer, and stops a SPLIT database being pinned to unified.
+test("the layout-aware `all` advice is not mistaken for a layout answer", async () => {
+	const kinds: unknown[] = []
+	const hydra = {
+		context: {
+			ingest: (args: Record<string, unknown>) => {
+				kinds.push(args.kind)
+				return Promise.reject(
+					new HydraWrapperError(
+						"Hydra /context/ingest → 400: invalid type 'all': it selects both corpora for reads " +
+							"and deletes, but an ingest must name the one it writes to. This database is " +
+							"unified, so send 'unified' or omit `type` entirely.",
+						"/context/ingest",
+						{ status: 400, body: { error: { code: "CORPUS_TYPE_UNSUPPORTED" } } },
+					),
+				)
+			},
+		},
+		databases: { layout: () => Promise.resolve("split") },
+	} as unknown as HydraDB
+	const client = new HydraClient("k", "tenant-a", "sub-a", undefined, hydra)
+	await assert.rejects(() => client.ingestText("note"), /invalid type 'all'/)
+	assert.deepEqual(kinds, ["memory"], "no retry, and the split layout is not pinned to unified")
+})

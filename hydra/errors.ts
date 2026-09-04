@@ -57,15 +57,25 @@ export class HydraWrapperError extends Error {
 export const CORPUS_TYPE_UNSUPPORTED_CODE = "CORPUS_TYPE_UNSUPPORTED"
 
 /**
- * The siblings under that code, excluded first: `unified` sent to a SPLIT
- * database, `all` on an ingest, and a `type` outside the vocabulary entirely.
- * All three name a unified database or a bad value rather than answering "this
- * database is unified", and retrying any of them as unified turns a clear 400
- * into a second, more confusing one. `invalid type` covers both the syntax
- * refusal and the `all`-on-ingest one, which share that opening.
+ * The siblings under that code, excluded FIRST — before the code is consulted,
+ * which is the whole reason the order matters. One code now covers five
+ * refusals and they do not all point the same way:
+ *
+ *   `unified` on a split database        only valid on a unified database
+ *   context_category on a split database only supported on a unified database
+ *   a `type` outside the vocabulary      invalid type "momory": must be …
+ *   `all` on an ingest                   invalid type 'all': …
+ *   items[] sent with type=knowledge     items cannot be combined with …
+ *
+ * Retrying any of them as unified turns a clear 400 into a second, more
+ * confusing one, and pinning the layout off one would strand a SPLIT database
+ * on `unified` for the life of the process. The `all` refusal matters most
+ * here: its advice clause is now layout-aware and says "This database is
+ * unified, so send 'unified'…", so excluding on `invalid type` before reading
+ * the code is what stops that sentence being read as a layout answer.
  */
 const OTHER_CORPUS_REFUSAL_RE =
-	/only valid on a unified database|only supported on a unified database|invalid type/i
+	/only valid on a unified database|only supported on a unified database|invalid type|items cannot be combined with/i
 
 /**
  * The wording of the refusal that IS ours, for a server that sends no code (an
