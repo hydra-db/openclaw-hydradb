@@ -100,6 +100,17 @@ export interface IngestParams {
 	 * the v1 client (which set `document_metadata` inside each memory payload).
 	 */
 	documentMetadata?: string
+	/**
+	 * Tenant-visible attributes on the item — the queryable half of an item's
+	 * metadata, as opposed to the opaque `documentMetadata` blob. Maps to
+	 * `tenant_metadata` on a split memory item and to `IngestItem.attributes`
+	 * on a unified one, so a caller sets it once and both layouts store it in
+	 * the same place. This mirrors hydradb-claude-code's `memoryToItem`, where
+	 * `tenant_metadata → attributes` and `document_metadata → custom_attributes`
+	 * are the two halves; the unified path here had only the second, so an item
+	 * could not carry attributes at all.
+	 */
+	tenantMetadata?: Record<string, unknown> | string
 	/** Filename to attach when ingesting knowledge text as a document. */
 	filename?: string
 	collection?: string
@@ -166,6 +177,21 @@ function compact(record: Record<string, unknown>): Record<string, unknown> {
 	const out: Record<string, unknown> = {}
 	for (const [k, v] of Object.entries(record)) if (v !== undefined) out[k] = v
 	return out
+}
+
+/**
+ * Metadata reaches the wrapper either as an object or as the pre-serialised
+ * JSON string the v1 client used. A unified item takes the object, so a string
+ * is parsed; a string that is not JSON is kept under `value` rather than thrown
+ * away. Mirrors hydradb-claude-code's `parseMaybeJson`.
+ */
+function parseMaybeJson(value: Record<string, unknown> | string): unknown {
+	if (typeof value !== "string") return value
+	try {
+		return JSON.parse(value)
+	} catch {
+		return { value }
+	}
 }
 
 function queryString(record: Record<string, string | number | undefined>): string {
@@ -303,6 +329,11 @@ export class ContextResource extends Resource {
 			if (params.documentMetadata != null) {
 				item.document_metadata = params.documentMetadata
 			}
+			// The split half of the same pair the unified path maps to
+			// `attributes`, so an item carries its attributes either way.
+			if (params.tenantMetadata != null) {
+				item.tenant_metadata = params.tenantMetadata
+			}
 			request.memories = JSON.stringify([item])
 		} else {
 			// Knowledge is multipart with the document as a file part — never the
@@ -342,6 +373,9 @@ export class ContextResource extends Resource {
 		item.enrich = params.infer ?? true
 		if (item.enrich && params.customInstructions != null) {
 			item.custom_instructions = params.customInstructions
+		}
+		if (params.tenantMetadata != null) {
+			item.attributes = parseMaybeJson(params.tenantMetadata)
 		}
 		if (params.documentMetadata != null) {
 			// The split path carries this as a pre-serialised JSON string; the

@@ -159,6 +159,20 @@ var HydraWrapperError = class _HydraWrapperError extends Error {
     Object.setPrototypeOf(this, _HydraWrapperError.prototype);
   }
 };
+var UNIFIED_LAYOUT_ERROR_CODE = "UNIFIED_DATABASE";
+var UNIFIED_LAYOUT_REFUSAL_RE = /is not valid on a unified database|this database is unified/i;
+function errorCodeOf(body) {
+  if (!body || typeof body !== "object") return void 0;
+  const record = body;
+  const nested = record.error;
+  const code = nested?.code ?? record.code ?? record.error_code;
+  return typeof code === "string" && code !== "" ? code : void 0;
+}
+function isUnifiedLayoutRefusal(err) {
+  if (err.status !== 400) return false;
+  if (errorCodeOf(err.body) === UNIFIED_LAYOUT_ERROR_CODE) return true;
+  return UNIFIED_LAYOUT_REFUSAL_RE.test(err.message);
+}
 function bodyToString(body) {
   if (body == null) return "";
   if (typeof body === "string") return body;
@@ -188,6 +202,10 @@ function translateError(path2, err) {
 // hydra/raw.ts
 var DEFAULT_BASE_URL = "https://api.hydradb.com";
 var RETRY_STATUSES = /* @__PURE__ */ new Set([408, 429, 500, 502, 503, 504]);
+var REPLAY_UNSAFE_WRITES = /* @__PURE__ */ new Set(["/context/ingest", "/databases"]);
+function isReplayUnsafe(method, path2) {
+  return method === "POST" && REPLAY_UNSAFE_WRITES.has(path2);
+}
 var RawHttp = class {
   constructor(config) {
     this.config = config;
@@ -201,7 +219,11 @@ var RawHttp = class {
   timeoutMs;
   fetchImpl;
   maxRetries;
-  /** Same retry tolerance the SDK gives every call: 429/5xx and network failures, short backoff. */
+  /**
+   * The SDK's retry tolerance — 429/5xx and network failures, short backoff —
+   * with one carve-out: a failure that carried no status is NOT retried for a
+   * write that cannot be safely replayed. See REPLAY_UNSAFE_WRITES.
+   */
   async request(method, path2, body) {
     let lastErr;
     for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
@@ -209,7 +231,7 @@ var RawHttp = class {
         return await this.once(method, path2, body);
       } catch (err) {
         lastErr = err;
-        const retryable = err instanceof HydraWrapperError && (err.status == null || RETRY_STATUSES.has(err.status));
+        const retryable = err instanceof HydraWrapperError && (err.status == null ? !isReplayUnsafe(method, path2) : RETRY_STATUSES.has(err.status));
         if (!retryable || attempt === this.maxRetries) throw err;
         await new Promise((resolve) => setTimeout(resolve, Math.min(250 * 2 ** attempt, 2e3)));
       }
@@ -271,6 +293,14 @@ function compact(record) {
   const out = {};
   for (const [k, v] of Object.entries(record)) if (v !== void 0) out[k] = v;
   return out;
+}
+function parseMaybeJson(value) {
+  if (typeof value !== "string") return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return { value };
+  }
 }
 function queryString(record) {
   const params = new URLSearchParams();
@@ -390,6 +420,9 @@ var ContextResource = class extends Resource {
       if (params.documentMetadata != null) {
         item.document_metadata = params.documentMetadata;
       }
+      if (params.tenantMetadata != null) {
+        item.tenant_metadata = params.tenantMetadata;
+      }
       request.memories = JSON.stringify([item]);
     } else {
       if (params.text != null) {
@@ -425,6 +458,9 @@ var ContextResource = class extends Resource {
     item.enrich = params.infer ?? true;
     if (item.enrich && params.customInstructions != null) {
       item.custom_instructions = params.customInstructions;
+    }
+    if (params.tenantMetadata != null) {
+      item.attributes = parseMaybeJson(params.tenantMetadata);
     }
     if (params.documentMetadata != null) {
       try {
@@ -747,11 +783,12 @@ var HydraClient = class {
     try {
       return await run(kind);
     } catch (err) {
-      const refused = err instanceof HydraWrapperError && err.status === 400 && /unified database/i.test(err.message);
+      const refused = err instanceof HydraWrapperError && isUnifiedLayoutRefusal(err);
       if (refused && kind !== "unified" && this.layoutSetting === "auto") {
         log.warn("[hydra] the database is unified; switching every call to kind unified");
+        const result = await run("unified");
         this.kindPromise = Promise.resolve("unified");
-        return run("unified");
+        return result;
       }
       throw err;
     }
@@ -768,7 +805,8 @@ var HydraClient = class {
       upsert: true,
       ...opts?.metadata && {
         documentMetadata: JSON.stringify(opts.metadata)
-      }
+      },
+      ...opts?.attributes && { tenantMetadata: opts.attributes }
     }));
     return toAddMemoryResponse(data);
   }
@@ -784,6 +822,7 @@ var HydraClient = class {
       },
       ...opts?.sourceId && { sourceId: opts.sourceId },
       ...opts?.title && { title: opts.title },
+      ...opts?.attributes && { tenantMetadata: opts.attributes },
       upsert: true
     }));
     return toAddMemoryResponse(data);
@@ -806,11 +845,17 @@ var HydraClient = class {
     const data = await this.withKind((kind) => this.hydra.context.list({ kind }));
     return toListMemoriesResponse(data);
   }
+  /**
+   * The document lane. On a split database that is `knowledge`, unchanged; on
+   * a unified one there is no knowledge corpus to name, so `knowledge` is an
+   * unconditional 400 — and being outside `withKind` this was the one call
+   * that did not even get the retry the rest of the client has.
+   */
   async listSources(sourceIds) {
-    const data = await this.hydra.context.list({
-      kind: "knowledge",
+    const data = await this.withKind((kind) => this.hydra.context.list({
+      kind: kind === "unified" ? "unified" : "knowledge",
       ...sourceIds && { ids: sourceIds }
-    });
+    }));
     return toListSourcesResponse(data);
   }
   // --- Delete ---
@@ -830,6 +875,17 @@ var HydraClient = class {
     return toFetchContentResponse(data);
   }
   // --- Accessors ---
+  /**
+   * The database's storage layout as the plugin currently understands it
+   * (PRO-1618). Reuses the one probe every call already awaits, so asking is
+   * free, and it reflects a layout pinned by a refusal in `withKind`. Callers
+   * use it to name what they are showing: a unified list returns documents
+   * next to memories, so calling them all "memories" is a promise the layout
+   * does not keep.
+   */
+  async layout() {
+    return await this.kind() === "unified" ? "unified" : "split";
+  }
   getTenantId() {
     return this.tenantId;
   }
@@ -1275,6 +1331,13 @@ function toToolSourceId(sessionId) {
   return `tool_${sessionId}`;
 }
 
+// vocabulary.ts
+function itemNoun(layout, plural = false) {
+  if (layout === "unified") return plural ? "items" : "item";
+  return plural ? "memories" : "memory";
+}
+var LAYOUT_NEUTRAL_ITEM_PHRASE = "stored items (memories on a split database; on a unified database one corpus holding memories and documents together)";
+
 // commands/slash.ts
 function preview(text, max = 80) {
   return text.length > max ? `${text.slice(0, max)}\u2026` : text;
@@ -1362,23 +1425,26 @@ ${lines.join("\n")}` };
   registerCommandWithAlias(
     api,
     {
-      description: "List all stored user memories",
+      description: "List everything stored for this user",
       acceptsArgs: false,
       requireAuth: true,
       handler: async () => {
         try {
           const res = await client.listMemories();
-          const memories = res.user_memories ?? [];
-          if (memories.length === 0) return { text: "No memories stored yet." };
-          const lines = memories.map(
+          const items = res.user_memories ?? [];
+          const layout = await client.layout();
+          if (items.length === 0) return { text: `No ${itemNoun(layout, true)} stored yet.` };
+          const lines = items.map(
             (m, i) => `${i + 1}. [${m.memory_id}] ${preview(m.memory_content, 100)}`
           );
-          return { text: `${memories.length} memories:
+          return {
+            text: `${items.length} ${itemNoun(layout, items.length !== 1)}:
 
-${lines.join("\n")}` };
+${lines.join("\n")}`
+          };
         } catch (err) {
           log.error("/hydradb-list", err);
-          return { text: "Failed to list memories. Check logs." };
+          return { text: "Failed to list stored items. Check logs." };
         }
       }
     },
@@ -1388,18 +1454,19 @@ ${lines.join("\n")}` };
   registerCommandWithAlias(
     api,
     {
-      description: "Delete a specific memory by its ID",
+      description: "Delete one stored item by its ID",
       acceptsArgs: true,
       requireAuth: true,
       handler: async (ctx) => {
         const memoryId = ctx.args?.trim();
-        if (!memoryId) return { text: "Usage: /hydradb-delete <memory_id>" };
+        if (!memoryId) return { text: "Usage: /hydradb-delete <id>" };
         try {
           const res = await client.deleteMemory(memoryId);
+          const noun = itemNoun(await client.layout());
           if (res.user_memory_deleted) {
-            return { text: `Deleted memory: ${memoryId}` };
+            return { text: `Deleted ${noun}: ${memoryId}` };
           }
-          return { text: `Memory ${memoryId} was not found or already deleted.` };
+          return { text: `No ${noun} ${memoryId} was found; it may already have been deleted.` };
         } catch (err) {
           log.error("/hydradb-delete", err);
           return { text: "Delete failed. Check logs." };
@@ -1552,6 +1619,16 @@ function filterIgnoredTurns(turns, ignoreTerm) {
     (t) => !containsIgnoreTerm(t.user, ignoreTerm) && !containsIgnoreTerm(t.assistant, ignoreTerm)
   );
 }
+function removeInjectedBlocks(text) {
+  return text.replace(/<hydra-context>[\s\S]*?<\/hydra-context>\s*/g, "").trim();
+}
+var MIN_TURN_CHARS = 5;
+function toIngestableTurns(turns) {
+  return turns.map((t) => ({
+    user: removeInjectedBlocks(t.user),
+    assistant: removeInjectedBlocks(t.assistant)
+  })).filter((t) => t.user.length >= MIN_TURN_CHARS && t.assistant.length >= MIN_TURN_CHARS);
+}
 function textFromMessage(msg) {
   const content = msg.content;
   if (typeof content === "string") return content;
@@ -1590,9 +1667,6 @@ function extractAllTurns(messages) {
 
 // hooks/capture.ts
 var MAX_HOOK_TURNS = -1;
-function removeInjectedBlocks(text) {
-  return text.replace(/<hydra-context>[\s\S]*?<\/hydra-context>\s*/g, "").trim();
-}
 function createIngestionHook(client, cfg) {
   return async (event, sessionId) => {
     try {
@@ -1621,10 +1695,7 @@ function createIngestionHook(client, cfg) {
         return;
       }
       const recentTurns = MAX_HOOK_TURNS === -1 ? allTurns : allTurns.slice(-MAX_HOOK_TURNS);
-      const turns = recentTurns.map((t) => ({
-        user: removeInjectedBlocks(t.user),
-        assistant: removeInjectedBlocks(t.assistant)
-      })).filter((t) => t.user.length >= 5 && t.assistant.length >= 5);
+      const turns = toIngestableTurns(recentTurns);
       if (turns.length === 0) {
         log.debug("[capture] skipped \u2014 all turns too short after cleaning");
         return;
@@ -1873,22 +1944,23 @@ function registerDeleteTool(api, client, _cfg) {
   registerToolWithAlias(
     api,
     {
-      label: "Hydra Delete Memory",
-      description: "Delete a specific memory from Hydra by its memory ID. Use this when the user explicitly asks you to forget something or remove a specific piece of stored information. Always confirm the memory ID before deleting.",
+      label: "Hydra Delete",
+      description: `Delete one stored item from Hydra by its ID \u2014 ${LAYOUT_NEUTRAL_ITEM_PHRASE}, so on a unified database this can remove a document as well as a memory. Use this when the user explicitly asks you to forget something or remove a specific piece of stored information. Always confirm the ID before deleting.`,
       parameters: Type.Object({
         memory_id: Type.String({
-          description: "The unique ID of the memory to delete"
+          description: "The unique ID of the item to delete"
         })
       }),
       async execute(_toolCallId, params) {
         log.debug(`delete tool: memory_id=${params.memory_id}`);
         const res = await client.deleteMemory(params.memory_id);
+        const noun = itemNoun(await client.layout());
         if (res.user_memory_deleted) {
           return {
             content: [
               {
                 type: "text",
-                text: `Successfully deleted memory: ${params.memory_id}`
+                text: `Successfully deleted ${noun}: ${params.memory_id}`
               }
             ]
           };
@@ -1897,7 +1969,7 @@ function registerDeleteTool(api, client, _cfg) {
           content: [
             {
               type: "text",
-              text: `Memory ${params.memory_id} was not found or has already been deleted.`
+              text: `No ${noun} ${params.memory_id} was found; it may already have been deleted.`
             }
           ]
         };
@@ -1961,24 +2033,25 @@ function registerListTool(api, client, _cfg) {
   registerToolWithAlias(
     api,
     {
-      label: "Hydra List Memories",
-      description: "List all user memories stored in Hydra. Returns memory IDs and content summaries. Use this when the user asks what you remember about them or wants to see their stored information.",
+      label: "Hydra List",
+      description: `List everything stored in Hydra for this user \u2014 ${LAYOUT_NEUTRAL_ITEM_PHRASE}. Returns IDs and content summaries. Use this when the user asks what you remember about them or wants to see their stored information.`,
       parameters: Type3.Object({}),
       async execute(_toolCallId, _params) {
-        log.debug("list tool: fetching all memories");
+        log.debug("list tool: fetching everything stored");
         const res = await client.listMemories();
-        const memories = res.user_memories ?? [];
-        if (memories.length === 0) {
+        const items = res.user_memories ?? [];
+        const layout = await client.layout();
+        if (items.length === 0) {
           return {
             content: [
               {
                 type: "text",
-                text: "No memories stored yet."
+                text: `No ${itemNoun(layout, true)} stored yet.`
               }
             ]
           };
         }
-        const lines = memories.map((m, i) => {
+        const lines = items.map((m, i) => {
           const preview2 = m.memory_content.length > 100 ? `${m.memory_content.slice(0, 100)}\u2026` : m.memory_content;
           return `${i + 1}. [ID: ${m.memory_id}]
    ${preview2}`;
@@ -1987,7 +2060,7 @@ function registerListTool(api, client, _cfg) {
           content: [
             {
               type: "text",
-              text: `Found ${memories.length} memories:
+              text: `Found ${items.length} ${itemNoun(layout, items.length !== 1)}:
 
 ${lines.join("\n\n")}`
             }
@@ -2054,9 +2127,6 @@ ${contextStr}`
 // tools/store.ts
 import { Type as Type5 } from "@sinclair/typebox";
 var MAX_STORE_TURNS = 10;
-function removeInjectedBlocks2(text) {
-  return text.replace(/<hydra-context>[\s\S]*?<\/hydra-context>\s*/g, "").trim();
-}
 function registerStoreTool(api, client, cfg, getSessionId, getMessages) {
   registerToolWithAlias(
     api,
@@ -2081,10 +2151,7 @@ function registerStoreTool(api, client, cfg, getSessionId, getMessages) {
         const rawTurns = extractAllTurns(messages);
         const filteredTurns = filterIgnoredTurns(rawTurns, cfg.ignoreTerm);
         const recentTurns = filteredTurns.slice(-MAX_STORE_TURNS);
-        const turns = recentTurns.map((t) => ({
-          user: removeInjectedBlocks2(t.user),
-          assistant: removeInjectedBlocks2(t.assistant)
-        }));
+        const turns = toIngestableTurns(recentTurns);
         log.debug(`[store] extracted ${rawTurns.length} total turns, ${rawTurns.length - filteredTurns.length} ignored, using last ${turns.length} (MAX_STORE_TURNS=${MAX_STORE_TURNS})`);
         if (turns.length > 0 && sourceId) {
           const now = /* @__PURE__ */ new Date();

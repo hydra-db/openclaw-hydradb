@@ -27,6 +27,27 @@ export interface RawConfig {
 
 const RETRY_STATUSES = new Set([408, 429, 500, 502, 503, 504])
 
+/**
+ * Writes whose outcome cannot be inferred from a failure that carried NO HTTP
+ * status — a 30s `AbortError` timeout, a dropped socket. The request may well
+ * have been applied server-side, and re-sending it creates a second copy rather
+ * than replacing the first: `ingestMemory` without a caller `sourceId` sends no
+ * `context_id`, so an upsert has nothing to key on.
+ *
+ * Two costs, one fix. Re-sending a POST that timed out at 30s spends up to 90s
+ * inside a hook budget the host will not wait for (hydradb-claude-code caps
+ * retries at zero outright for exactly this reason), and it duplicates context.
+ * So: a status-carrying failure on these paths still retries when the status
+ * says the server declined before doing work; a status-LESS failure never does.
+ * Reads (`/query`, `/context/list`, `GET /databases`) keep the full budget —
+ * replaying one costs nothing but time.
+ */
+const REPLAY_UNSAFE_WRITES = new Set(["/context/ingest", "/databases"])
+
+function isReplayUnsafe(method: string, path: string): boolean {
+	return method === "POST" && REPLAY_UNSAFE_WRITES.has(path)
+}
+
 export class RawHttp {
 	private readonly baseUrl: string
 	private readonly timeoutMs: number
@@ -40,7 +61,11 @@ export class RawHttp {
 		this.maxRetries = config.maxRetries ?? 2
 	}
 
-	/** Same retry tolerance the SDK gives every call: 429/5xx and network failures, short backoff. */
+	/**
+	 * The SDK's retry tolerance — 429/5xx and network failures, short backoff —
+	 * with one carve-out: a failure that carried no status is NOT retried for a
+	 * write that cannot be safely replayed. See REPLAY_UNSAFE_WRITES.
+	 */
 	async request<T>(method: "GET" | "POST" | "DELETE", path: string, body?: unknown): Promise<T> {
 		let lastErr: unknown
 		for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
@@ -49,7 +74,10 @@ export class RawHttp {
 			} catch (err) {
 				lastErr = err
 				const retryable =
-					err instanceof HydraWrapperError && (err.status == null || RETRY_STATUSES.has(err.status))
+					err instanceof HydraWrapperError &&
+					(err.status == null
+						? !isReplayUnsafe(method, path)
+						: RETRY_STATUSES.has(err.status))
 				if (!retryable || attempt === this.maxRetries) throw err
 				await new Promise((resolve) => setTimeout(resolve, Math.min(250 * 2 ** attempt, 2000)))
 			}

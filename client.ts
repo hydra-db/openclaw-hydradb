@@ -6,7 +6,7 @@ import {
 	toListSourcesResponse,
 	toRecallResponse,
 } from "./adapters.ts"
-import { HydraDB, HydraWrapperError } from "./hydra/index.ts"
+import { HydraDB, HydraWrapperError, isUnifiedLayoutRefusal } from "./hydra/index.ts"
 import type { ContextKind, Layout } from "./hydra/index.ts"
 import { log } from "./log.ts"
 import type {
@@ -107,12 +107,16 @@ export class HydraClient {
 		try {
 			return await run(kind)
 		} catch (err) {
-			const refused =
-				err instanceof HydraWrapperError && err.status === 400 && /unified database/i.test(err.message)
+			const refused = err instanceof HydraWrapperError && isUnifiedLayoutRefusal(err)
 			if (refused && kind !== "unified" && this.layoutSetting === "auto") {
 				log.warn("[hydra] the database is unified; switching every call to kind unified")
+				const result = await run("unified")
+				// Pinned only once the retry has ACTUALLY succeeded. Pinning
+				// first meant a retry that failed for an unrelated reason (a
+				// timeout, a 500) left the process sending `unified` for its
+				// whole lifetime against a database that may well be split.
 				this.kindPromise = Promise.resolve<ContextKind>("unified")
-				return run("unified")
+				return result
 			}
 			throw err
 		}
@@ -126,6 +130,9 @@ export class HydraClient {
 		opts?: {
 			userName?: string
 			metadata?: Record<string, unknown>
+			/** Tenant-visible attributes; `attributes` on a unified item,
+			 *  `tenant_metadata` on a split one. See IngestParams. */
+			attributes?: Record<string, unknown>
 		},
 	): Promise<AddMemoryResponse> {
 		const data = await this.withKind((kind) => this.hydra.context.ingest({
@@ -139,6 +146,7 @@ export class HydraClient {
 			...(opts?.metadata && {
 				documentMetadata: JSON.stringify(opts.metadata),
 			}),
+			...(opts?.attributes && { tenantMetadata: opts.attributes }),
 		}))
 		return toAddMemoryResponse(data)
 	}
@@ -151,6 +159,9 @@ export class HydraClient {
 			infer?: boolean
 			isMarkdown?: boolean
 			customInstructions?: string
+			/** Tenant-visible attributes; `attributes` on a unified item,
+			 *  `tenant_metadata` on a split one. See IngestParams. */
+			attributes?: Record<string, unknown>
 		},
 	): Promise<AddMemoryResponse> {
 		const shouldInfer = opts?.infer ?? true
@@ -164,6 +175,7 @@ export class HydraClient {
 			}),
 			...(opts?.sourceId && { sourceId: opts.sourceId }),
 			...(opts?.title && { title: opts.title }),
+			...(opts?.attributes && { tenantMetadata: opts.attributes }),
 			upsert: true,
 		}))
 		return toAddMemoryResponse(data)
@@ -199,11 +211,17 @@ export class HydraClient {
 		return toListMemoriesResponse(data)
 	}
 
+	/**
+	 * The document lane. On a split database that is `knowledge`, unchanged; on
+	 * a unified one there is no knowledge corpus to name, so `knowledge` is an
+	 * unconditional 400 — and being outside `withKind` this was the one call
+	 * that did not even get the retry the rest of the client has.
+	 */
 	async listSources(sourceIds?: string[]): Promise<ListSourcesResponse> {
-		const data = await this.hydra.context.list({
-			kind: "knowledge",
+		const data = await this.withKind((kind) => this.hydra.context.list({
+			kind: kind === "unified" ? "unified" : "knowledge",
 			...(sourceIds && { ids: sourceIds }),
-		})
+		}))
 		return toListSourcesResponse(data)
 	}
 
@@ -231,6 +249,18 @@ export class HydraClient {
 	}
 
 	// --- Accessors ---
+
+	/**
+	 * The database's storage layout as the plugin currently understands it
+	 * (PRO-1618). Reuses the one probe every call already awaits, so asking is
+	 * free, and it reflects a layout pinned by a refusal in `withKind`. Callers
+	 * use it to name what they are showing: a unified list returns documents
+	 * next to memories, so calling them all "memories" is a promise the layout
+	 * does not keep.
+	 */
+	async layout(): Promise<Layout> {
+		return (await this.kind()) === "unified" ? "unified" : "split"
+	}
 
 	getTenantId(): string {
 		return this.tenantId

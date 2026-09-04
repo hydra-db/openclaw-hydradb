@@ -2,7 +2,7 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 
 import { HydraClient } from "../client.ts"
-import { HydraDB } from "../hydra/index.ts"
+import { HydraDB, HydraWrapperError } from "../hydra/index.ts"
 import type { HydraDBClient } from "@hydradb/sdk"
 
 // The OpenClaw analog of the MCP client payload test (hydradb-mcp PR #36). The
@@ -111,7 +111,7 @@ test("recall maps to a memory query with the v1 defaults (alpha 0.8, mode thinki
 	assert.equal(query.args.graphContext, true)
 })
 
-test("listSources scopes to knowledge and passes ids", async () => {
+test("listSources scopes to knowledge on a split database and passes ids", async () => {
 	const { client, calls } = mockClient({
 		list: { inner: { sources: [], total: 0 } },
 	})
@@ -219,4 +219,97 @@ test("listMemories reads the source shape a unified list returns", async () => {
 	const client = new HydraClient("k", "tenant-a", "sub-a", undefined, hydra)
 	const res = await client.listMemories()
 	assert.deepEqual(res.user_memories, [{ memory_id: "doc-1", memory_content: "Ledger notes" }])
+})
+
+// PRO-1618: `listSources` was the one method left outside `withKind`, so on a
+// unified database it sent a hardcoded `knowledge` — an unconditional 400 that
+// did not even get the retry the rest of the client has.
+test("listSources sends kind unified on a unified database", async () => {
+	const { client, calls } = mockClientWithLayout("unified")
+	await client.listSources(["source-1"])
+	const list = calls.find((c) => c.method === "list")!
+	assert.equal(list.args.kind, "unified")
+	assert.deepEqual(list.args.ids, ["source-1"])
+})
+
+// The refusal has two wordings. The ingest-body one ("this database is
+// unified: …") is the one a `/unified database/i` pattern misses entirely.
+test("a unified refusal worded as `this database is unified` still retries", async () => {
+	const calls: Recorded[] = []
+	const hydra = {
+		context: {
+			list: (args: Record<string, unknown>) => {
+				calls.push({ method: "list", args })
+				if (args.kind !== "unified") {
+					return Promise.reject(
+						new HydraWrapperError(
+							"Hydra /context/list → 400: this database is unified: send the content as `items`",
+							"/context/list",
+							{ status: 400, body: { error: { code: "UNIFIED_DATABASE" } } },
+						),
+					)
+				}
+				return Promise.resolve({ sources: [], total: 0 })
+			},
+		},
+		databases: { layout: () => Promise.reject(new Error("probe failed")) },
+	} as unknown as HydraDB
+	const client = new HydraClient("k", "tenant-a", "sub-a", undefined, hydra)
+	await client.listSources()
+	assert.deepEqual(calls.map((c) => c.args.kind), ["knowledge", "unified"])
+})
+
+// A retry that fails for an UNRELATED reason must not pin the layout: it never
+// proved the database is unified, and pinning stranded the whole process.
+test("a failed unified retry does not pin the layout", async () => {
+	const kinds: unknown[] = []
+	const hydra = {
+		context: {
+			query: (args: Record<string, unknown>) => {
+				kinds.push(args.kind)
+				if (args.kind === "unified") {
+					return Promise.reject(
+						new HydraWrapperError("Hydra /query → 503: upstream unavailable", "/query", {
+							status: 503,
+						}),
+					)
+				}
+				return Promise.reject(
+					new HydraWrapperError(
+						'Hydra /query → 400: type "memory" is not valid on a unified database',
+						"/query",
+						{ status: 400 },
+					),
+				)
+			},
+		},
+		databases: { layout: () => Promise.reject(new Error("probe failed")) },
+	} as unknown as HydraDB
+	const client = new HydraClient("k", "tenant-a", "sub-a", undefined, hydra)
+	await assert.rejects(() => client.recall("q"), /503/)
+	assert.equal(await client.layout(), "split", "the layout must NOT be pinned by a failed retry")
+	assert.deepEqual(kinds, ["memory", "unified"])
+})
+
+// PRO-1618: on a unified database the list is the whole corpus, so it carries
+// documents next to memories and the wording has to say so.
+test("layout() reports what the plugin will call a stored item", async () => {
+	const { client: unified } = mockClientWithLayout("unified")
+	assert.equal(await unified.layout(), "unified")
+	const { client: split } = mockClientWithLayout("split")
+	assert.equal(await split.layout(), "split")
+})
+
+// The unified item gained the `attributes` half of the metadata pair; the split
+// item carries the same value as `tenant_metadata`, so a caller sets it once.
+test("ingest carries attributes on both layouts", async () => {
+	const { client: unified, calls: unifiedCalls } = mockClientWithLayout("unified")
+	await unified.ingestText("note", { attributes: { topic: "ui" } })
+	assert.deepEqual(unifiedCalls[0]!.args.tenantMetadata, { topic: "ui" })
+
+	const { client: split, calls: splitCalls } = mockClientWithLayout("split")
+	await split.ingestConversation([{ user: "a", assistant: "b" }], "s1", {
+		attributes: { topic: "ui" },
+	})
+	assert.deepEqual(splitCalls[0]!.args.tenantMetadata, { topic: "ui" })
 })

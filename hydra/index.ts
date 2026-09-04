@@ -22,5 +22,10 @@ export type {
 	CreateDatabaseParams,
 	Layout,
 } from "./client.ts"
-export { HydraWrapperError, translateError } from "./errors.ts"
+export {
+	HydraWrapperError,
+	isUnifiedLayoutRefusal,
+	translateError,
+	UNIFIED_LAYOUT_ERROR_CODE,
+} from "./errors.ts"
 export { unwrap } from "./envelope.ts"

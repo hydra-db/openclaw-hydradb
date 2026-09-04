@@ -198,3 +198,42 @@ test("unified query, list and delete bypass the SDK request serializers and retu
 	assert.equal(calls[2]!.init.method, "DELETE")
 	assert.deepEqual(JSON.parse(String(calls[2]!.init.body)), { database: "db_u", collection: "c1", ids: ["a"], type: "unified" })
 })
+
+// PRO-1618 / hook budget: a write that failed WITHOUT a status (an AbortError
+// timeout, a dropped socket) may already have been applied server-side, and
+// `ingestMemory` with no caller `sourceId` sends no `context_id`, so re-sending
+// creates a second context rather than upserting the first. It also spends the
+// whole per-attempt timeout again inside a hook budget the host will not wait
+// for. So a status-less failure is never replayed on those paths.
+test("a timed-out ingest is not retried", async () => {
+	let attempts = 0
+	const fetchImpl = (() => {
+		attempts += 1
+		const err = new Error("The operation was aborted")
+		err.name = "AbortError"
+		return Promise.reject(err)
+	}) as typeof fetch
+	const hydra = new HydraDB(
+		{ token: "t", database: "db_u", baseUrl: "https://api.test", fetch: fetchImpl },
+		{} as HydraDBClient,
+	)
+	await assert.rejects(() => hydra.context.ingest({ kind: "unified", text: "note" }))
+	assert.equal(attempts, 1, "a non-idempotent write must not be re-sent when the outcome is unknown")
+})
+
+// Reads keep the full budget: replaying one costs nothing but time.
+test("a timed-out read still retries", async () => {
+	let attempts = 0
+	const fetchImpl = (() => {
+		attempts += 1
+		const err = new Error("The operation was aborted")
+		err.name = "AbortError"
+		return Promise.reject(err)
+	}) as typeof fetch
+	const hydra = new HydraDB(
+		{ token: "t", database: "db_u", baseUrl: "https://api.test", fetch: fetchImpl },
+		{} as HydraDBClient,
+	)
+	assert.equal(await hydra.databases.layout("db_u"), "split", "a failed probe reads as split")
+	assert.ok(attempts > 1, "a read is safe to replay and keeps the SDK's retry budget")
+})

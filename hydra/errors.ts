@@ -47,6 +47,42 @@ export class HydraWrapperError extends Error {
 	}
 }
 
+/**
+ * PRO-1618: the server's machine-readable code for "you sent a split-era `type`
+ * to a unified database". Preferred over the message text, which is worded
+ * differently depending on which validator refuses.
+ */
+export const UNIFIED_LAYOUT_ERROR_CODE = "UNIFIED_DATABASE"
+
+/**
+ * The message fallback, for a server that does not send the code yet. It has to
+ * cover BOTH phrasings:
+ *
+ *   corpus type validator: `type "memory" is not valid on a unified database: …`
+ *   ingest body validator: `this database is unified: send the content as …`
+ *
+ * and must NOT match the mirror-image refusals, which name a unified database
+ * while telling you the database is SPLIT (`type "unified" is only valid on a
+ * unified database…`). Retrying one of those as unified turns a clear 400 into
+ * a second, more confusing one.
+ */
+const UNIFIED_LAYOUT_REFUSAL_RE = /is not valid on a unified database|this database is unified/i
+
+function errorCodeOf(body: unknown): string | undefined {
+	if (!body || typeof body !== "object") return undefined
+	const record = body as Record<string, unknown>
+	const nested = record.error as Record<string, unknown> | undefined
+	const code = nested?.code ?? record.code ?? record.error_code
+	return typeof code === "string" && code !== "" ? code : undefined
+}
+
+/** Whether an error is the server refusing a split-era `type` on a unified database. */
+export function isUnifiedLayoutRefusal(err: HydraWrapperError): boolean {
+	if (err.status !== 400) return false
+	if (errorCodeOf(err.body) === UNIFIED_LAYOUT_ERROR_CODE) return true
+	return UNIFIED_LAYOUT_REFUSAL_RE.test(err.message)
+}
+
 function bodyToString(body: unknown): string {
 	if (body == null) return ""
 	if (typeof body === "string") return body
