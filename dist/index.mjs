@@ -265,7 +265,7 @@ var RawHttp = class {
       }
       if (!response.ok) {
         const detail = parsed && typeof parsed === "object" ? JSON.stringify(parsed) : String(parsed ?? "");
-        throw new HydraWrapperError(`Hydra DB ${path2} \u2192 ${response.status}: ${detail}`, path2, {
+        throw new HydraWrapperError(`Hydra ${path2} \u2192 ${response.status}: ${detail}`, path2, {
           status: response.status,
           body: parsed
         });
@@ -274,7 +274,7 @@ var RawHttp = class {
     } catch (err) {
       if (err instanceof HydraWrapperError) throw err;
       const reason = err instanceof Error && err.name === "AbortError" ? `timed out after ${this.timeoutMs}ms` : err instanceof Error ? err.message : String(err);
-      throw new HydraWrapperError(`Hydra DB ${path2} \u2192 ERR: ${reason}`, path2, { cause: err });
+      throw new HydraWrapperError(`Hydra ${path2} \u2192 ERR: ${reason}`, path2, { cause: err });
     } finally {
       clearTimeout(timer);
     }

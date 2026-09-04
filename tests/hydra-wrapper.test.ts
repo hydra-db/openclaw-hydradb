@@ -338,3 +338,49 @@ test("the context_category refusal is never read as a layout answer", () => {
 	)
 	assert.equal(isUnifiedLayoutRefusal(err), false)
 })
+
+// The raw transport was ported from the MCP wrapper and brought its `Hydra DB …`
+// prefix with it. OpenClaw's contract is `Hydra ${path} → …` (errors.ts), and
+// `translateError` returns a HydraWrapperError untouched, so a raw-built message
+// reaches an agent tool — and therefore the model — exactly as written. Both raw
+// branches are pinned: the status one and the status-less one.
+test("raw errors use OpenClaw's `Hydra …` template, not the MCP `Hydra DB …` one", async () => {
+	const failing = (() =>
+		Promise.resolve(
+			new Response(JSON.stringify({ success: false, error: { message: "nope" } }), {
+				status: 400,
+				headers: { "content-type": "application/json" },
+			}),
+		)) as typeof fetch
+	const hydra = new HydraDB(
+		{ token: "t", database: "db_u", baseUrl: "https://api.test", fetch: failing },
+		{} as HydraDBClient,
+	)
+	await assert.rejects(
+		() => hydra.context.ingest({ kind: "unified", text: "note" }),
+		(err: unknown) => {
+			assert.ok(err instanceof HydraWrapperError)
+			assert.match(err.message, /^Hydra \/context\/ingest → 400: /)
+			assert.ok(!err.message.startsWith("Hydra DB "), "the MCP prefix must not leak into OpenClaw")
+			return true
+		},
+	)
+
+	const aborting = (() => {
+		const err = new Error("The operation was aborted")
+		err.name = "AbortError"
+		return Promise.reject(err)
+	}) as typeof fetch
+	const timing = new HydraDB(
+		{ token: "t", database: "db_u", baseUrl: "https://api.test", fetch: aborting },
+		{} as HydraDBClient,
+	)
+	await assert.rejects(
+		() => timing.context.ingest({ kind: "unified", text: "note" }),
+		(err: unknown) => {
+			assert.ok(err instanceof HydraWrapperError)
+			assert.match(err.message, /^Hydra \/context\/ingest → ERR: timed out after \d+ms$/)
+			return true
+		},
+	)
+})

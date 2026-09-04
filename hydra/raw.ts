@@ -5,6 +5,13 @@
  * multipart fields it knows and strips unknown JSON keys, so until the SDK is
  * regenerated these go over the wire by hand, through the same envelope unwrap
  * and error translation as everything else. Ported from the MCP wrapper.
+ *
+ * One thing does NOT come across from that port: the error prefix. The MCP
+ * wrapper says `Hydra DB …`; OpenClaw's contract is `Hydra ${path} → …`, the
+ * byte-identical v1 text (see ./errors.ts). `translateError` returns a
+ * HydraWrapperError untouched, so anything built here reaches an agent tool —
+ * and therefore the model — exactly as written. Build errors with the OpenClaw
+ * template, never the MCP one.
  */
 
 import { unwrap } from "./envelope.ts"
@@ -112,7 +119,7 @@ export class RawHttp {
 					parsed && typeof parsed === "object"
 						? JSON.stringify(parsed)
 						: String(parsed ?? "")
-				throw new HydraWrapperError(`Hydra DB ${path} → ${response.status}: ${detail}`, path, {
+				throw new HydraWrapperError(`Hydra ${path} → ${response.status}: ${detail}`, path, {
 					status: response.status,
 					body: parsed,
 				})
@@ -126,7 +133,7 @@ export class RawHttp {
 					: err instanceof Error
 						? err.message
 						: String(err)
-			throw new HydraWrapperError(`Hydra DB ${path} → ERR: ${reason}`, path, { cause: err })
+			throw new HydraWrapperError(`Hydra ${path} → ERR: ${reason}`, path, { cause: err })
 		} finally {
 			clearTimeout(timer)
 		}
