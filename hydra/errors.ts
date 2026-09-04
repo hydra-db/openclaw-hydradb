@@ -48,23 +48,32 @@ export class HydraWrapperError extends Error {
 }
 
 /**
- * PRO-1618: the server's machine-readable code for "you sent a split-era `type`
- * to a unified database". Preferred over the message text, which is worded
- * differently depending on which validator refuses.
+ * PRO-1618: the server's machine-readable code for a `type` the addressed
+ * database does not accept (hydradb-application #870, handler/errors.go). It
+ * names the FAMILY, not the member: the same code covers knowledge/memory on a
+ * unified database, `unified` on a split one, and `all` on an ingest. Only the
+ * first of those is ours to retry, so the code narrows and the message decides.
  */
-export const UNIFIED_LAYOUT_ERROR_CODE = "UNIFIED_DATABASE"
+export const CORPUS_TYPE_UNSUPPORTED_CODE = "CORPUS_TYPE_UNSUPPORTED"
 
 /**
- * The message fallback, for a server that does not send the code yet. It has to
- * cover BOTH phrasings:
+ * The two siblings under that code, excluded first. Both name a unified
+ * database while telling you this one is SPLIT, or that the value is wrong
+ * whatever the layout; retrying either as unified turns a clear 400 into a
+ * second, more confusing one.
+ */
+const OTHER_CORPUS_REFUSAL_RE =
+	/only valid on a unified database|only supported on a unified database|invalid type ['"]all['"]/i
+
+/**
+ * The wording of the refusal that IS ours, for a server that sends no code (an
+ * older build, a proxy that ate the envelope). Two validators answer it:
  *
  *   corpus type validator: `type "memory" is not valid on a unified database: …`
  *   ingest body validator: `this database is unified: send the content as …`
  *
- * and must NOT match the mirror-image refusals, which name a unified database
- * while telling you the database is SPLIT (`type "unified" is only valid on a
- * unified database…`). Retrying one of those as unified turns a clear 400 into
- * a second, more confusing one.
+ * The server treats this text as a contract precisely because clients match on
+ * it, so it stays as the fallback rather than being deleted once the code ships.
  */
 const UNIFIED_LAYOUT_REFUSAL_RE = /is not valid on a unified database|this database is unified/i
 
@@ -79,7 +88,8 @@ function errorCodeOf(body: unknown): string | undefined {
 /** Whether an error is the server refusing a split-era `type` on a unified database. */
 export function isUnifiedLayoutRefusal(err: HydraWrapperError): boolean {
 	if (err.status !== 400) return false
-	if (errorCodeOf(err.body) === UNIFIED_LAYOUT_ERROR_CODE) return true
+	if (OTHER_CORPUS_REFUSAL_RE.test(err.message)) return false
+	if (errorCodeOf(err.body) === CORPUS_TYPE_UNSUPPORTED_CODE) return true
 	return UNIFIED_LAYOUT_REFUSAL_RE.test(err.message)
 }
 

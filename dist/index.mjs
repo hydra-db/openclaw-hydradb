@@ -159,7 +159,8 @@ var HydraWrapperError = class _HydraWrapperError extends Error {
     Object.setPrototypeOf(this, _HydraWrapperError.prototype);
   }
 };
-var UNIFIED_LAYOUT_ERROR_CODE = "UNIFIED_DATABASE";
+var CORPUS_TYPE_UNSUPPORTED_CODE = "CORPUS_TYPE_UNSUPPORTED";
+var OTHER_CORPUS_REFUSAL_RE = /only valid on a unified database|only supported on a unified database|invalid type ['"]all['"]/i;
 var UNIFIED_LAYOUT_REFUSAL_RE = /is not valid on a unified database|this database is unified/i;
 function errorCodeOf(body) {
   if (!body || typeof body !== "object") return void 0;
@@ -170,7 +171,8 @@ function errorCodeOf(body) {
 }
 function isUnifiedLayoutRefusal(err) {
   if (err.status !== 400) return false;
-  if (errorCodeOf(err.body) === UNIFIED_LAYOUT_ERROR_CODE) return true;
+  if (OTHER_CORPUS_REFUSAL_RE.test(err.message)) return false;
+  if (errorCodeOf(err.body) === CORPUS_TYPE_UNSUPPORTED_CODE) return true;
   return UNIFIED_LAYOUT_REFUSAL_RE.test(err.message);
 }
 function bodyToString(body) {

@@ -245,7 +245,7 @@ test("a unified refusal worded as `this database is unified` still retries", asy
 						new HydraWrapperError(
 							"Hydra /context/list → 400: this database is unified: send the content as `items`",
 							"/context/list",
-							{ status: 400, body: { error: { code: "UNIFIED_DATABASE" } } },
+							{ status: 400, body: { error: { code: "CORPUS_TYPE_UNSUPPORTED" } } },
 						),
 					)
 				}
@@ -312,4 +312,29 @@ test("ingest carries attributes on both layouts", async () => {
 		attributes: { topic: "ui" },
 	})
 	assert.deepEqual(splitCalls[0]!.args.tenantMetadata, { topic: "ui" })
+})
+
+// CORPUS_TYPE_UNSUPPORTED covers three refusals, and only one of them is ours.
+// `unified` sent to a SPLIT database carries the same code, and retrying it as
+// unified would turn a clear 400 into a second, more confusing one.
+test("a split database refusing `unified` is not retried, despite the same code", async () => {
+	const kinds: unknown[] = []
+	const hydra = {
+		context: {
+			query: (args: Record<string, unknown>) => {
+				kinds.push(args.kind)
+				return Promise.reject(
+					new HydraWrapperError(
+						'Hydra /query → 400: type "unified" is only valid on a unified database; this database stores knowledge and memory separately',
+						"/query",
+						{ status: 400, body: { error: { code: "CORPUS_TYPE_UNSUPPORTED" } } },
+					),
+				)
+			},
+		},
+		databases: { layout: () => Promise.resolve("split") },
+	} as unknown as HydraDB
+	const client = new HydraClient("k", "tenant-a", "sub-a", undefined, hydra)
+	await assert.rejects(() => client.recall("q"), /only valid on a unified database/)
+	assert.deepEqual(kinds, ["memory"], "no retry: this is the sibling refusal, not ours")
 })

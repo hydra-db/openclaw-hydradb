@@ -26,6 +26,6 @@ export {
 	HydraWrapperError,
 	isUnifiedLayoutRefusal,
 	translateError,
-	UNIFIED_LAYOUT_ERROR_CODE,
+	CORPUS_TYPE_UNSUPPORTED_CODE,
 } from "./errors.ts"
 export { unwrap } from "./envelope.ts"
