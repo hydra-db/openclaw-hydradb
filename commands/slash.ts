@@ -4,6 +4,7 @@ import type { HydraPluginConfig } from "../config.ts"
 import { log } from "../log.ts"
 import { toToolSourceId } from "../session.ts"
 import { SLASH_NAMES, warnDeprecated } from "../tool-names.ts"
+import { itemNoun } from "../vocabulary.ts"
 
 function preview(text: string, max = 80): string {
 	return text.length > max ? `${text.slice(0, max)}…` : text
@@ -127,22 +128,27 @@ export function registerSlashCommands(
 	registerCommandWithAlias(
 		api,
 		{
-			description: "List all stored user memories",
+			description: "List everything stored for this user",
 			acceptsArgs: false,
 			requireAuth: true,
 			handler: async () => {
 				try {
 					const res = await client.listMemories()
-					const memories = res.user_memories ?? []
-					if (memories.length === 0) return { text: "No memories stored yet." }
+					const items = res.user_memories ?? []
+					// On a unified database this list is the whole corpus, so it
+					// carries documents next to memories (PRO-1618).
+					const layout = await client.layout()
+					if (items.length === 0) return { text: `No ${itemNoun(layout, true)} stored yet.` }
 
-					const lines = memories.map(
+					const lines = items.map(
 						(m, i) => `${i + 1}. [${m.memory_id}] ${preview(m.memory_content, 100)}`,
 					)
-					return { text: `${memories.length} memories:\n\n${lines.join("\n")}` }
+					return {
+						text: `${items.length} ${itemNoun(layout, items.length !== 1)}:\n\n${lines.join("\n")}`,
+					}
 				} catch (err) {
 					log.error("/hydradb-list", err)
-					return { text: "Failed to list memories. Check logs." }
+					return { text: "Failed to list stored items. Check logs." }
 				}
 			},
 		},
@@ -154,19 +160,20 @@ export function registerSlashCommands(
 	registerCommandWithAlias(
 		api,
 		{
-			description: "Delete a specific memory by its ID",
+			description: "Delete one stored item by its ID",
 			acceptsArgs: true,
 			requireAuth: true,
 			handler: async (ctx: { args?: string }) => {
 				const memoryId = ctx.args?.trim()
-				if (!memoryId) return { text: "Usage: /hydradb-delete <memory_id>" }
+				if (!memoryId) return { text: "Usage: /hydradb-delete <id>" }
 
 				try {
 					const res = await client.deleteMemory(memoryId)
+					const noun = itemNoun(await client.layout())
 					if (res.user_memory_deleted) {
-						return { text: `Deleted memory: ${memoryId}` }
+						return { text: `Deleted ${noun}: ${memoryId}` }
 					}
-					return { text: `Memory ${memoryId} was not found or already deleted.` }
+					return { text: `No ${noun} ${memoryId} was found; it may already have been deleted.` }
 				} catch (err) {
 					log.error("/hydradb-delete", err)
 					return { text: "Delete failed. Check logs." }

@@ -1,15 +1,11 @@
 import type { HydraClient } from "../client.ts"
 import type { HydraPluginConfig } from "../config.ts"
 import { log } from "../log.ts"
-import { extractAllTurns, filterIgnoredTurns } from "../messages.ts"
+import { extractAllTurns, filterIgnoredTurns, toIngestableTurns } from "../messages.ts"
 import { toHookSourceId } from "../session.ts"
 import type { ConversationTurn } from "../types/hydra.ts"
 
 const MAX_HOOK_TURNS = -1
-
-function removeInjectedBlocks(text: string): string {
-	return text.replace(/<hydra-context>[\s\S]*?<\/hydra-context>\s*/g, "").trim()
-}
 
 export function createIngestionHook(
 	client: HydraClient,
@@ -50,10 +46,7 @@ export function createIngestionHook(
 			}
 
 			const recentTurns = MAX_HOOK_TURNS === -1 ? allTurns : allTurns.slice(-MAX_HOOK_TURNS) 
-			const turns: ConversationTurn[] = recentTurns.map((t) => ({
-				user: removeInjectedBlocks(t.user),
-				assistant: removeInjectedBlocks(t.assistant),
-			})).filter((t) => t.user.length >= 5 && t.assistant.length >= 5)
+			const turns: ConversationTurn[] = toIngestableTurns(recentTurns)
 
 			if (turns.length === 0) {
 				log.debug("[capture] skipped — all turns too short after cleaning")

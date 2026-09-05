@@ -65,6 +65,11 @@
 			"placeholder": "hydra-ignore",
 			"help": "Messages containing this term will be excluded from recall and capture (default: hydra-ignore)"
 		},
+		"layout": {
+			"label": "Database Layout",
+			"help": "'auto' (default) reads it from Hydra; 'unified' for a database created with type=unified (one corpus, no kind); 'split' for the classic knowledge/memory layout",
+			"advanced": true
+		},
 		"debug": {
 			"label": "Debug Logging",
 			"help": "Enable verbose debug logs for API calls and responses",
@@ -79,6 +84,7 @@
 			"tenantId": { "type": "string" },
 			"subTenantId": { "type": "string" },
 			"autoRecall": { "type": "boolean" },
+			"layout": { "type": "string", "enum": ["auto", "split", "unified"] },
 			"autoCapture": { "type": "boolean" },
 			"maxRecallResults": { "type": "number", "minimum": 1, "maximum": 50 },
 			"recallMode": { "type": "string", "enum": ["fast", "thinking"] },

@@ -76,12 +76,22 @@ export function toRecallResponse(data: SDK.SearchV2RetrievalResult): RecallRespo
 export function toAddMemoryResponse(
 	data: SDK.IngestionV2SourceUploadResponse,
 ): AddMemoryResponse {
+	// Read both spellings: the SDK deserialises to camelCase, the raw unified
+	// ingest path (PRO-1618) is normalised to the same names but a wire-shaped
+	// payload must still count rather than read as zero.
+	const d = data as unknown as Record<string, unknown>
+	const num = (...keys: string[]): number => {
+		for (const key of keys) {
+			if (typeof d[key] === "number") return d[key] as number
+		}
+		return 0
+	}
 	return {
 		success: data.success ?? false,
 		message: data.message ?? "",
 		results: [],
-		success_count: data.successCount ?? 0,
-		failed_count: data.failedCount ?? 0,
+		success_count: num("successCount", "success_count"),
+		failed_count: num("failedCount", "failed_count"),
 	}
 }
 
@@ -104,16 +114,21 @@ export function toListMemoriesResponse(
 	// Memories surface at top-level `user_memories` — not under an `.inner`
 	// wrapper, and not under `sources` (that is the knowledge shape).
 	const d = data as unknown as Record<string, unknown>
+	const inner = d.inner as Record<string, unknown> | undefined
+	// A unified database (PRO-1618) lists every item in the SOURCE shape
+	// (`sources`), so that is read when no memory rows are present.
 	const records =
 		asRecords(d.user_memories) ??
-		asRecords((d.inner as Record<string, unknown> | undefined)?.user_memories) ??
+		asRecords(inner?.user_memories) ??
+		asRecords(d.sources) ??
+		asRecords(inner?.sources) ??
 		[]
 	return {
 		success: true,
 		user_memories: records.map((record) => ({
 			memory_id: str(record, "memory_id", "id", "source_id") ?? "",
 			memory_content:
-				str(record, "memory_content", "content", "text", "memory", "title") ?? "",
+				str(record, "memory_content", "content", "text", "memory", "title", "description") ?? "",
 		})),
 	}
 }

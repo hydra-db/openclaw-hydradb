@@ -41,12 +41,19 @@ function toRecallResponse(data) {
   };
 }
 function toAddMemoryResponse(data) {
+  const d = data;
+  const num = (...keys) => {
+    for (const key of keys) {
+      if (typeof d[key] === "number") return d[key];
+    }
+    return 0;
+  };
   return {
     success: data.success ?? false,
     message: data.message ?? "",
     results: [],
-    success_count: data.successCount ?? 0,
-    failed_count: data.failedCount ?? 0
+    success_count: num("successCount", "success_count"),
+    failed_count: num("failedCount", "failed_count")
   };
 }
 function str(record, ...keys) {
@@ -61,12 +68,13 @@ function asRecords(value) {
 }
 function toListMemoriesResponse(data) {
   const d = data;
-  const records = asRecords(d.user_memories) ?? asRecords(d.inner?.user_memories) ?? [];
+  const inner = d.inner;
+  const records = asRecords(d.user_memories) ?? asRecords(inner?.user_memories) ?? asRecords(d.sources) ?? asRecords(inner?.sources) ?? [];
   return {
     success: true,
     user_memories: records.map((record) => ({
       memory_id: str(record, "memory_id", "id", "source_id") ?? "",
-      memory_content: str(record, "memory_content", "content", "text", "memory", "title") ?? ""
+      memory_content: str(record, "memory_content", "content", "text", "memory", "title", "description") ?? ""
     }))
   };
 }
@@ -115,7 +123,7 @@ function toFetchContentResponse(data) {
 
 // hydra/client.ts
 import { Buffer } from "node:buffer";
-import { HydraDBClient } from "@hydradb/sdk";
+import { HydraDBClient, serialization } from "@hydradb/sdk";
 
 // hydra/envelope.ts
 function isEnvelope(value) {
@@ -151,6 +159,23 @@ var HydraWrapperError = class _HydraWrapperError extends Error {
     Object.setPrototypeOf(this, _HydraWrapperError.prototype);
   }
 };
+var CORPUS_TYPE_UNSUPPORTED_CODE = "CORPUS_TYPE_UNSUPPORTED";
+var OTHER_CORPUS_REFUSAL_RE = /only valid on a unified database|only supported on a unified database|invalid type|items cannot be combined with/i;
+var UNIFIED_LAYOUT_REFUSAL_RE = /is not valid on a unified database|this database is unified/i;
+function errorCodeOf(body) {
+  if (!body || typeof body !== "object") return void 0;
+  const record = body;
+  const nested = record.error;
+  const detail = record.detail;
+  const code = nested?.code ?? detail?.error_code ?? record.code ?? record.error_code;
+  return typeof code === "string" && code !== "" ? code : void 0;
+}
+function isUnifiedLayoutRefusal(err) {
+  if (err.status !== 400) return false;
+  if (OTHER_CORPUS_REFUSAL_RE.test(err.message)) return false;
+  if (errorCodeOf(err.body) === CORPUS_TYPE_UNSUPPORTED_CODE) return true;
+  return UNIFIED_LAYOUT_REFUSAL_RE.test(err.message);
+}
 function bodyToString(body) {
   if (body == null) return "";
   if (typeof body === "string") return body;
@@ -161,6 +186,7 @@ function bodyToString(body) {
   }
 }
 function translateError(path2, err) {
+  if (err instanceof HydraWrapperError) return err;
   if (err instanceof HydraDBError) {
     const status = err.statusCode;
     const statusText = status != null ? String(status) : "ERR";
@@ -176,9 +202,122 @@ function translateError(path2, err) {
   });
 }
 
+// hydra/raw.ts
+var DEFAULT_BASE_URL = "https://api.hydradb.com";
+var RETRY_STATUSES = /* @__PURE__ */ new Set([408, 429, 500, 502, 503, 504]);
+var REPLAY_UNSAFE_WRITES = /* @__PURE__ */ new Set(["/context/ingest", "/databases"]);
+function isReplayUnsafe(method, operationPath) {
+  return method === "POST" && REPLAY_UNSAFE_WRITES.has(operationPath);
+}
+function operationPathOf(path2) {
+  const queryStart = path2.indexOf("?");
+  return queryStart === -1 ? path2 : path2.slice(0, queryStart);
+}
+var RawHttp = class {
+  constructor(config) {
+    this.config = config;
+    this.baseUrl = (config.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, "");
+    this.timeoutMs = config.timeoutMs ?? 3e4;
+    this.fetchImpl = config.fetch ?? fetch;
+    this.maxRetries = config.maxRetries ?? 2;
+  }
+  config;
+  baseUrl;
+  timeoutMs;
+  fetchImpl;
+  maxRetries;
+  /**
+   * The SDK's retry tolerance — 429/5xx and network failures, short backoff —
+   * with one carve-out: a failure that carried no status is NOT retried for a
+   * write that cannot be safely replayed. See REPLAY_UNSAFE_WRITES.
+   */
+  async request(method, path2, body) {
+    const operationPath = operationPathOf(path2);
+    let lastErr;
+    for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+      try {
+        return await this.once(method, path2, body, operationPath);
+      } catch (err) {
+        lastErr = err;
+        const retryable = err instanceof HydraWrapperError && (err.status == null ? !isReplayUnsafe(method, operationPath) : RETRY_STATUSES.has(err.status));
+        if (!retryable || attempt === this.maxRetries) throw err;
+        await new Promise((resolve) => setTimeout(resolve, Math.min(250 * 2 ** attempt, 2e3)));
+      }
+    }
+    throw lastErr;
+  }
+  async once(method, path2, body, operationPath) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    try {
+      const response = await this.fetchImpl(`${this.baseUrl}${path2}`, {
+        method,
+        headers: {
+          Authorization: `Bearer ${this.config.token}`,
+          "Content-Type": "application/json",
+          // CONTRACT §2 rule 6: every v2 call names its version.
+          "API-Version": "2"
+        },
+        ...body !== void 0 ? { body: JSON.stringify(body) } : {},
+        signal: controller.signal
+      });
+      const text = await response.text();
+      let parsed;
+      try {
+        parsed = text === "" ? null : JSON.parse(text);
+      } catch {
+        parsed = text;
+      }
+      if (!response.ok) {
+        const detail = parsed && typeof parsed === "object" ? JSON.stringify(parsed) : String(parsed ?? "");
+        throw new HydraWrapperError(
+          `Hydra ${operationPath} \u2192 ${response.status}: ${detail}`,
+          operationPath,
+          { status: response.status, body: parsed }
+        );
+      }
+      return unwrap(parsed);
+    } catch (err) {
+      if (err instanceof HydraWrapperError) throw err;
+      const reason = err instanceof Error && err.name === "AbortError" ? `timed out after ${this.timeoutMs}ms` : err instanceof Error ? err.message : String(err);
+      throw new HydraWrapperError(`Hydra ${operationPath} \u2192 ERR: ${reason}`, operationPath, {
+        cause: err
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+};
+
 // hydra/client.ts
 function kindToType(kind) {
   return kind;
+}
+var SDK_PARSE_OPTS = {
+  unrecognizedObjectKeys: "passthrough",
+  allowUnrecognizedUnionMembers: true,
+  allowUnrecognizedEnumValues: true,
+  skipValidation: true,
+  breadcrumbsPrefix: ["response"]
+};
+function compact(record) {
+  const out = {};
+  for (const [k, v] of Object.entries(record)) if (v !== void 0) out[k] = v;
+  return out;
+}
+function parseMaybeJson(value) {
+  if (typeof value !== "string") return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return { value };
+  }
+}
+function queryString(record) {
+  const params = new URLSearchParams();
+  for (const [k, v] of Object.entries(record)) if (v !== void 0) params.set(k, String(v));
+  const encoded = params.toString();
+  return encoded === "" ? "" : `?${encoded}`;
 }
 var Resource = class {
   constructor(sdk, database, collection) {
@@ -189,6 +328,28 @@ var Resource = class {
   sdk;
   database;
   collection;
+  /** Hand-rolled v2 transport for calls the pinned SDK cannot make; see ./raw.ts. */
+  raw;
+  /** @internal */
+  attachRaw(raw) {
+    this.raw = raw;
+  }
+  requireRaw(what) {
+    if (!this.raw) {
+      throw new Error(`${what} needs the v2 transport, which this HydraDB instance was built without`);
+    }
+    return this.raw;
+  }
+  /**
+   * A raw v2 call whose wire result is run through the SDK's OWN response
+   * serializer, so the caller gets the same camelCase object the SDK path
+   * returns. Used for `kind: "unified"` (PRO-1618): the pinned SDK's REQUEST
+   * serializers reject that enum value before anything is sent.
+   */
+  async rawTyped(what, method, path2, body, parse) {
+    const wire = await this.requireRaw(what).request(method, path2, body);
+    return parse(wire, SDK_PARSE_OPTS);
+  }
   scope(override) {
     const collection = override ?? this.collection;
     return collection != null ? { database: this.database, collection } : { database: this.database };
@@ -207,6 +368,28 @@ var ContextResource = class extends Resource {
   }
   /** The single retrieval entry point (SDK `client.query`). */
   query(params) {
+    if (params.kind === "unified") {
+      return this.call(
+        "/query",
+        () => this.rawTyped(
+          "unified query",
+          "POST",
+          "/query",
+          compact({
+            ...this.scope(params.collection),
+            query: params.query,
+            type: "unified",
+            operator: params.operator,
+            max_results: params.maxResults,
+            mode: params.mode,
+            graph_context: params.graphContext,
+            alpha: params.alpha,
+            recency_bias: params.recencyBias
+          }),
+          serialization.SearchV2RetrievalResult.parseOrThrow
+        )
+      );
+    }
     return this.call(
       "/query",
       () => this.sdk.query({
@@ -224,6 +407,7 @@ var ContextResource = class extends Resource {
   }
   /** Ingest a memory or knowledge item (SDK `context.ingest`, multipart). */
   ingest(params) {
+    if (params.kind === "unified") return this.ingestUnified(params);
     const request = {
       ...this.scope(params.collection),
       type: kindToType(params.kind)
@@ -247,6 +431,9 @@ var ContextResource = class extends Resource {
       if (params.documentMetadata != null) {
         item.document_metadata = params.documentMetadata;
       }
+      if (params.tenantMetadata != null) {
+        item.tenant_metadata = params.tenantMetadata;
+      }
       request.memories = JSON.stringify([item]);
     } else {
       if (params.text != null) {
@@ -262,8 +449,73 @@ var ContextResource = class extends Resource {
     }
     return this.call("/context/ingest", () => this.sdk.context.ingest(request));
   }
+  /**
+   * The unified ingest shape (PRO-1618): one `items[]` array, each item text or
+   * a conversation, no corpus selector, sent as the JSON body of
+   * `POST /context/ingest`. On a split database the items land in its memory
+   * corpus, so a caller that has not created a unified database sees no change.
+   */
+  ingestUnified(params) {
+    const item = {};
+    if (params.text != null) item.text = params.text;
+    if (params.pairs != null) {
+      item.conversation = params.pairs.flatMap((turn) => [
+        { role: "user", content: turn.user, ...params.userName ? { name: params.userName } : {} },
+        { role: "assistant", content: turn.assistant }
+      ]);
+    }
+    if (params.sourceId != null) item.context_id = params.sourceId;
+    if (params.title != null) item.title = params.title;
+    item.enrich = params.infer ?? true;
+    if (item.enrich && params.customInstructions != null) {
+      item.custom_instructions = params.customInstructions;
+    }
+    if (params.tenantMetadata != null) {
+      item.attributes = parseMaybeJson(params.tenantMetadata);
+    }
+    if (params.documentMetadata != null) {
+      try {
+        item.custom_attributes = JSON.parse(params.documentMetadata);
+      } catch {
+        item.custom_attributes = { document_metadata: params.documentMetadata };
+      }
+    }
+    const body = {
+      ...this.scope(params.collection),
+      items: [item],
+      ...params.upsert != null ? { upsert: params.upsert } : {}
+    };
+    return this.call(
+      "/context/ingest",
+      () => this.rawTyped(
+        "unified ingest",
+        "POST",
+        "/context/ingest",
+        body,
+        serialization.IngestionV2SourceUploadResponse.parseOrThrow
+      )
+    );
+  }
   /** List memories or knowledge sources (SDK `context.list`). */
   list(params = {}) {
+    if (params.kind === "unified") {
+      return this.call(
+        "/context/list",
+        () => this.rawTyped(
+          "unified list",
+          "POST",
+          "/context/list",
+          compact({
+            ...this.scope(params.collection),
+            type: "unified",
+            ids: params.ids,
+            page: params.page,
+            page_size: params.pageSize
+          }),
+          serialization.ListV2SourceListResponse.parseOrThrow
+        )
+      );
+    }
     return this.call(
       "/context/list",
       () => this.sdk.context.list({
@@ -299,6 +551,26 @@ var ContextResource = class extends Resource {
   }
   /** Knowledge-graph relations (SDK `context.relations`). */
   relations(params = {}) {
+    if (params.kind === "unified") {
+      const scope = this.scope(params.collection);
+      return this.call(
+        "/context/relations",
+        () => this.rawTyped(
+          "unified relations",
+          "GET",
+          `/context/relations${queryString({
+            database: scope.database,
+            collection: scope.collection,
+            id: params.id,
+            type: "unified",
+            limit: params.limit,
+            cursor: params.cursor
+          })}`,
+          void 0,
+          serialization.GraphGraphRelationsResponse.parseOrThrow
+        )
+      );
+    }
     return this.call(
       "/context/relations",
       () => this.sdk.context.relations({
@@ -312,6 +584,18 @@ var ContextResource = class extends Resource {
   }
   /** Delete memories or knowledge sources (SDK `context.delete`). */
   delete(params) {
+    if (params.kind === "unified") {
+      return this.call(
+        "/context",
+        () => this.rawTyped(
+          "unified delete",
+          "DELETE",
+          "/context",
+          compact({ ...this.scope(params.collection), ids: params.ids, type: "unified" }),
+          serialization.SourcesMemoryDeleteResponse.parseOrThrow
+        )
+      );
+    }
     return this.call(
       "/context",
       () => this.sdk.context.delete({
@@ -327,6 +611,21 @@ var DatabasesResource = class extends Resource {
     super(sdk, database, collection);
   }
   create(params) {
+    if (params.type != null) {
+      return this.call(
+        "/databases",
+        () => this.requireRaw("database create with a layout").request(
+          "POST",
+          "/databases",
+          {
+            database: params.database,
+            type: params.type,
+            ...params.databaseMetadataSchema != null ? { database_metadata_schema: params.databaseMetadataSchema } : {},
+            ...params.embeddingsDimension != null ? { embeddings_dimension: params.embeddingsDimension } : {}
+          }
+        )
+      );
+    }
     return this.call(
       "/databases",
       () => this.sdk.databases.create({
@@ -341,6 +640,39 @@ var DatabasesResource = class extends Resource {
   }
   list() {
     return this.call("/databases", () => this.sdk.databases.list());
+  }
+  layoutCache;
+  /**
+   * Every database this key can see, with its storage layout (PRO-1618), from
+   * `GET /databases` `details[]`. Memoised for the process: a layout is fixed
+   * at creation, so it cannot go stale.
+   */
+  layouts() {
+    if (!this.layoutCache) {
+      this.layoutCache = this.requireRaw("layout probe").request("GET", "/databases").then((listed) => {
+        const map = /* @__PURE__ */ new Map();
+        for (const row of listed.details ?? []) {
+          if (row.database) map.set(row.database, row.type === "unified" ? "unified" : "split");
+        }
+        return map;
+      }).catch((err) => {
+        this.layoutCache = void 0;
+        throw err;
+      });
+    }
+    return this.layoutCache;
+  }
+  /**
+   * The layout of one database. Unknown, or a failed probe, reads as `split`,
+   * which every database created before PRO-1618 is: the worst case is the old
+   * default, never a wrong unified call.
+   */
+  async layout(database) {
+    try {
+      return (await this.layouts()).get(database) ?? "split";
+    } catch {
+      return "split";
+    }
   }
   collections(database) {
     return this.call(
@@ -376,6 +708,9 @@ var HydraDB = class {
       config.database,
       config.collection
     );
+    const raw = new RawHttp({ token: config.token, baseUrl: config.baseUrl, fetch: config.fetch });
+    this.context.attachRaw(raw);
+    this.databases.attachRaw(raw);
   }
 };
 
@@ -421,9 +756,12 @@ var HydraClient = class {
   tenantId;
   subTenantId;
   hydra;
-  constructor(apiKey, tenantId, subTenantId, baseUrl, hydra) {
+  layoutSetting;
+  kindPromise;
+  constructor(apiKey, tenantId, subTenantId, baseUrl, hydra, layout = "auto") {
     this.tenantId = tenantId;
     this.subTenantId = subTenantId;
+    this.layoutSetting = layout;
     this.hydra = hydra ?? new HydraDB({
       token: apiKey,
       database: tenantId,
@@ -432,10 +770,44 @@ var HydraClient = class {
     });
     log.info(`connected (tenant=${tenantId}, sub=${subTenantId})`);
   }
+  /**
+   * The kind every call sends (PRO-1618). A unified database refuses
+   * `memory`, so on one the plugin sends `unified`; on a split database
+   * (every database created before) it keeps sending `memory`, exactly as
+   * before. Resolved once per process; a failed probe reads as split.
+   */
+  kind() {
+    if (!this.kindPromise) {
+      this.kindPromise = this.layoutSetting === "auto" ? Promise.resolve().then(() => this.hydra.databases.layout(this.tenantId)).then((layout) => layout === "unified" ? "unified" : "memory").catch(() => "memory") : Promise.resolve(this.layoutSetting === "unified" ? "unified" : "memory");
+    }
+    return this.kindPromise;
+  }
+  /**
+   * Run one call with the resolved kind. If the kind came from a probe that
+   * could not tell (it failed, or the database was not in the list it saw)
+   * and the server answers with the rule ("type 'memory' is not valid on a
+   * unified database"), that answer IS the layout: pin it and retry once as
+   * `unified`. A pinned `layout` setting is never second-guessed.
+   */
+  async withKind(run) {
+    const kind = await this.kind();
+    try {
+      return await run(kind);
+    } catch (err) {
+      const refused = err instanceof HydraWrapperError && isUnifiedLayoutRefusal(err);
+      if (refused && kind !== "unified" && this.layoutSetting === "auto") {
+        log.warn("[hydra] the database is unified; switching every call to kind unified");
+        const result = await run("unified");
+        this.kindPromise = Promise.resolve("unified");
+        return result;
+      }
+      throw err;
+    }
+  }
   // --- Ingest ---
   async ingestConversation(turns, sourceId, opts) {
-    const data = await this.hydra.context.ingest({
-      kind: "memory",
+    const data = await this.withKind((kind) => this.hydra.context.ingest({
+      kind,
       pairs: turns,
       infer: true,
       sourceId,
@@ -444,14 +816,15 @@ var HydraClient = class {
       upsert: true,
       ...opts?.metadata && {
         documentMetadata: JSON.stringify(opts.metadata)
-      }
-    });
+      },
+      ...opts?.attributes && { tenantMetadata: opts.attributes }
+    }));
     return toAddMemoryResponse(data);
   }
   async ingestText(text, opts) {
     const shouldInfer = opts?.infer ?? true;
-    const data = await this.hydra.context.ingest({
-      kind: "memory",
+    const data = await this.withKind((kind) => this.hydra.context.ingest({
+      kind,
       text,
       infer: shouldInfer,
       isMarkdown: opts?.isMarkdown ?? false,
@@ -460,41 +833,48 @@ var HydraClient = class {
       },
       ...opts?.sourceId && { sourceId: opts.sourceId },
       ...opts?.title && { title: opts.title },
+      ...opts?.attributes && { tenantMetadata: opts.attributes },
       upsert: true
-    });
+    }));
     return toAddMemoryResponse(data);
   }
   // --- Recall ---
   async recall(query, opts) {
-    const data = await this.hydra.context.query({
+    const data = await this.withKind((kind) => this.hydra.context.query({
       query,
-      kind: "memory",
+      kind,
       maxResults: opts?.maxResults ?? 10,
       mode: opts?.mode ?? "thinking",
       alpha: 0.8,
       recencyBias: opts?.recencyBias ?? 0,
       graphContext: opts?.graphContext ?? true
-    });
+    }));
     return toRecallResponse(data);
   }
   // --- List ---
   async listMemories() {
-    const data = await this.hydra.context.list({ kind: "memory" });
+    const data = await this.withKind((kind) => this.hydra.context.list({ kind }));
     return toListMemoriesResponse(data);
   }
+  /**
+   * The document lane. On a split database that is `knowledge`, unchanged; on
+   * a unified one there is no knowledge corpus to name, so `knowledge` is an
+   * unconditional 400 — and being outside `withKind` this was the one call
+   * that did not even get the retry the rest of the client has.
+   */
   async listSources(sourceIds) {
-    const data = await this.hydra.context.list({
-      kind: "knowledge",
+    const data = await this.withKind((kind) => this.hydra.context.list({
+      kind: kind === "unified" ? "unified" : "knowledge",
       ...sourceIds && { ids: sourceIds }
-    });
+    }));
     return toListSourcesResponse(data);
   }
   // --- Delete ---
   async deleteMemory(memoryId) {
-    const data = await this.hydra.context.delete({
+    const data = await this.withKind((kind) => this.hydra.context.delete({
       ids: [memoryId],
-      kind: "memory"
-    });
+      kind
+    }));
     return toDeleteMemoryResponse(data);
   }
   // --- Fetch Content ---
@@ -506,6 +886,17 @@ var HydraClient = class {
     return toFetchContentResponse(data);
   }
   // --- Accessors ---
+  /**
+   * The database's storage layout as the plugin currently understands it
+   * (PRO-1618). Reuses the one probe every call already awaits, so asking is
+   * free, and it reflects a layout pinned by a refusal in `withKind`. Callers
+   * use it to name what they are showing: a unified list returns documents
+   * next to memories, so calling them all "memories" is a promise the layout
+   * does not keep.
+   */
+  async layout() {
+    return await this.kind() === "unified" ? "unified" : "split";
+  }
   getTenantId() {
     return this.tenantId;
   }
@@ -951,6 +1342,13 @@ function toToolSourceId(sessionId) {
   return `tool_${sessionId}`;
 }
 
+// vocabulary.ts
+function itemNoun(layout, plural = false) {
+  if (layout === "unified") return plural ? "items" : "item";
+  return plural ? "memories" : "memory";
+}
+var LAYOUT_NEUTRAL_ITEM_PHRASE = "stored items (memories on a split database; on a unified database one corpus holding memories and documents together)";
+
 // commands/slash.ts
 function preview(text, max = 80) {
   return text.length > max ? `${text.slice(0, max)}\u2026` : text;
@@ -1038,23 +1436,26 @@ ${lines.join("\n")}` };
   registerCommandWithAlias(
     api,
     {
-      description: "List all stored user memories",
+      description: "List everything stored for this user",
       acceptsArgs: false,
       requireAuth: true,
       handler: async () => {
         try {
           const res = await client.listMemories();
-          const memories = res.user_memories ?? [];
-          if (memories.length === 0) return { text: "No memories stored yet." };
-          const lines = memories.map(
+          const items = res.user_memories ?? [];
+          const layout = await client.layout();
+          if (items.length === 0) return { text: `No ${itemNoun(layout, true)} stored yet.` };
+          const lines = items.map(
             (m, i) => `${i + 1}. [${m.memory_id}] ${preview(m.memory_content, 100)}`
           );
-          return { text: `${memories.length} memories:
+          return {
+            text: `${items.length} ${itemNoun(layout, items.length !== 1)}:
 
-${lines.join("\n")}` };
+${lines.join("\n")}`
+          };
         } catch (err) {
           log.error("/hydradb-list", err);
-          return { text: "Failed to list memories. Check logs." };
+          return { text: "Failed to list stored items. Check logs." };
         }
       }
     },
@@ -1064,18 +1465,19 @@ ${lines.join("\n")}` };
   registerCommandWithAlias(
     api,
     {
-      description: "Delete a specific memory by its ID",
+      description: "Delete one stored item by its ID",
       acceptsArgs: true,
       requireAuth: true,
       handler: async (ctx) => {
         const memoryId = ctx.args?.trim();
-        if (!memoryId) return { text: "Usage: /hydradb-delete <memory_id>" };
+        if (!memoryId) return { text: "Usage: /hydradb-delete <id>" };
         try {
           const res = await client.deleteMemory(memoryId);
+          const noun = itemNoun(await client.layout());
           if (res.user_memory_deleted) {
-            return { text: `Deleted memory: ${memoryId}` };
+            return { text: `Deleted ${noun}: ${memoryId}` };
           }
-          return { text: `Memory ${memoryId} was not found or already deleted.` };
+          return { text: `No ${noun} ${memoryId} was found; it may already have been deleted.` };
         } catch (err) {
           log.error("/hydradb-delete", err);
           return { text: "Delete failed. Check logs." };
@@ -1125,7 +1527,8 @@ var KNOWN_KEYS = /* @__PURE__ */ new Set([
   "recallMode",
   "graphContext",
   "ignoreTerm",
-  "debug"
+  "debug",
+  "layout"
 ]);
 var DEFAULT_SUB_TENANT = "hydra-openclaw-plugin";
 var DEFAULT_IGNORE_TERM = "hydra-ignore";
@@ -1190,8 +1593,14 @@ function parseConfig(raw) {
     recallMode: cfg.recallMode === "thinking" ? "thinking" : "fast",
     graphContext: cfg.graphContext ?? true,
     ignoreTerm: typeof cfg.ignoreTerm === "string" && cfg.ignoreTerm.length > 0 ? cfg.ignoreTerm : DEFAULT_IGNORE_TERM,
-    debug: cfg.debug ?? false
+    debug: cfg.debug ?? false,
+    layout: parseLayout(cfg.layout)
   };
+}
+function parseLayout(value) {
+  if (value === void 0) return "auto";
+  if (value === "split" || value === "unified" || value === "auto") return value;
+  throw new Error(`hydra-db: layout must be "split", "unified" or "auto"`);
 }
 function tryParseConfig(raw) {
   try {
@@ -1220,6 +1629,16 @@ function filterIgnoredTurns(turns, ignoreTerm) {
   return turns.filter(
     (t) => !containsIgnoreTerm(t.user, ignoreTerm) && !containsIgnoreTerm(t.assistant, ignoreTerm)
   );
+}
+function removeInjectedBlocks(text) {
+  return text.replace(/<hydra-context>[\s\S]*?<\/hydra-context>\s*/g, "").trim();
+}
+var MIN_TURN_CHARS = 5;
+function toIngestableTurns(turns) {
+  return turns.map((t) => ({
+    user: removeInjectedBlocks(t.user),
+    assistant: removeInjectedBlocks(t.assistant)
+  })).filter((t) => t.user.length >= MIN_TURN_CHARS && t.assistant.length >= MIN_TURN_CHARS);
 }
 function textFromMessage(msg) {
   const content = msg.content;
@@ -1259,9 +1678,6 @@ function extractAllTurns(messages) {
 
 // hooks/capture.ts
 var MAX_HOOK_TURNS = -1;
-function removeInjectedBlocks(text) {
-  return text.replace(/<hydra-context>[\s\S]*?<\/hydra-context>\s*/g, "").trim();
-}
 function createIngestionHook(client, cfg) {
   return async (event, sessionId) => {
     try {
@@ -1290,10 +1706,7 @@ function createIngestionHook(client, cfg) {
         return;
       }
       const recentTurns = MAX_HOOK_TURNS === -1 ? allTurns : allTurns.slice(-MAX_HOOK_TURNS);
-      const turns = recentTurns.map((t) => ({
-        user: removeInjectedBlocks(t.user),
-        assistant: removeInjectedBlocks(t.assistant)
-      })).filter((t) => t.user.length >= 5 && t.assistant.length >= 5);
+      const turns = toIngestableTurns(recentTurns);
       if (turns.length === 0) {
         log.debug("[capture] skipped \u2014 all turns too short after cleaning");
         return;
@@ -1542,22 +1955,23 @@ function registerDeleteTool(api, client, _cfg) {
   registerToolWithAlias(
     api,
     {
-      label: "Hydra Delete Memory",
-      description: "Delete a specific memory from Hydra by its memory ID. Use this when the user explicitly asks you to forget something or remove a specific piece of stored information. Always confirm the memory ID before deleting.",
+      label: "Hydra Delete",
+      description: `Delete one stored item from Hydra by its ID \u2014 ${LAYOUT_NEUTRAL_ITEM_PHRASE}, so on a unified database this can remove a document as well as a memory. Use this when the user explicitly asks you to forget something or remove a specific piece of stored information. Always confirm the ID before deleting.`,
       parameters: Type.Object({
         memory_id: Type.String({
-          description: "The unique ID of the memory to delete"
+          description: "The unique ID of the item to delete"
         })
       }),
       async execute(_toolCallId, params) {
         log.debug(`delete tool: memory_id=${params.memory_id}`);
         const res = await client.deleteMemory(params.memory_id);
+        const noun = itemNoun(await client.layout());
         if (res.user_memory_deleted) {
           return {
             content: [
               {
                 type: "text",
-                text: `Successfully deleted memory: ${params.memory_id}`
+                text: `Successfully deleted ${noun}: ${params.memory_id}`
               }
             ]
           };
@@ -1566,7 +1980,7 @@ function registerDeleteTool(api, client, _cfg) {
           content: [
             {
               type: "text",
-              text: `Memory ${params.memory_id} was not found or has already been deleted.`
+              text: `No ${noun} ${params.memory_id} was found; it may already have been deleted.`
             }
           ]
         };
@@ -1630,24 +2044,25 @@ function registerListTool(api, client, _cfg) {
   registerToolWithAlias(
     api,
     {
-      label: "Hydra List Memories",
-      description: "List all user memories stored in Hydra. Returns memory IDs and content summaries. Use this when the user asks what you remember about them or wants to see their stored information.",
+      label: "Hydra List",
+      description: `List everything stored in Hydra for this user \u2014 ${LAYOUT_NEUTRAL_ITEM_PHRASE}. Returns IDs and content summaries. Use this when the user asks what you remember about them or wants to see their stored information.`,
       parameters: Type3.Object({}),
       async execute(_toolCallId, _params) {
-        log.debug("list tool: fetching all memories");
+        log.debug("list tool: fetching everything stored");
         const res = await client.listMemories();
-        const memories = res.user_memories ?? [];
-        if (memories.length === 0) {
+        const items = res.user_memories ?? [];
+        const layout = await client.layout();
+        if (items.length === 0) {
           return {
             content: [
               {
                 type: "text",
-                text: "No memories stored yet."
+                text: `No ${itemNoun(layout, true)} stored yet.`
               }
             ]
           };
         }
-        const lines = memories.map((m, i) => {
+        const lines = items.map((m, i) => {
           const preview2 = m.memory_content.length > 100 ? `${m.memory_content.slice(0, 100)}\u2026` : m.memory_content;
           return `${i + 1}. [ID: ${m.memory_id}]
    ${preview2}`;
@@ -1656,7 +2071,7 @@ function registerListTool(api, client, _cfg) {
           content: [
             {
               type: "text",
-              text: `Found ${memories.length} memories:
+              text: `Found ${items.length} ${itemNoun(layout, items.length !== 1)}:
 
 ${lines.join("\n\n")}`
             }
@@ -1723,9 +2138,6 @@ ${contextStr}`
 // tools/store.ts
 import { Type as Type5 } from "@sinclair/typebox";
 var MAX_STORE_TURNS = 10;
-function removeInjectedBlocks2(text) {
-  return text.replace(/<hydra-context>[\s\S]*?<\/hydra-context>\s*/g, "").trim();
-}
 function registerStoreTool(api, client, cfg, getSessionId, getMessages) {
   registerToolWithAlias(
     api,
@@ -1750,10 +2162,7 @@ function registerStoreTool(api, client, cfg, getSessionId, getMessages) {
         const rawTurns = extractAllTurns(messages);
         const filteredTurns = filterIgnoredTurns(rawTurns, cfg.ignoreTerm);
         const recentTurns = filteredTurns.slice(-MAX_STORE_TURNS);
-        const turns = recentTurns.map((t) => ({
-          user: removeInjectedBlocks2(t.user),
-          assistant: removeInjectedBlocks2(t.assistant)
-        }));
+        const turns = toIngestableTurns(recentTurns);
         log.debug(`[store] extracted ${rawTurns.length} total turns, ${rawTurns.length - filteredTurns.length} ignored, using last ${turns.length} (MAX_STORE_TURNS=${MAX_STORE_TURNS})`);
         if (turns.length > 0 && sourceId) {
           const now = /* @__PURE__ */ new Date();
@@ -1820,7 +2229,7 @@ var index_default = {
   configSchema: hydraConfigSchema,
   register(api) {
     const cfg = tryParseConfig(api.pluginConfig);
-    const cliClient = cfg ? new HydraClient(cfg.apiKey, cfg.tenantId, cfg.subTenantId, cfg.baseUrl) : null;
+    const cliClient = cfg ? new HydraClient(cfg.apiKey, cfg.tenantId, cfg.subTenantId, cfg.baseUrl, void 0, cfg.layout) : null;
     api.registerCli(
       ({ program }) => {
         const canonicalRoot = program.command("hydradb").description("Hydra DB memory commands");
@@ -1844,7 +2253,7 @@ var index_default = {
       return;
     }
     log.init(api.logger, cfg.debug);
-    const client = new HydraClient(cfg.apiKey, cfg.tenantId, cfg.subTenantId, cfg.baseUrl);
+    const client = new HydraClient(cfg.apiKey, cfg.tenantId, cfg.subTenantId, cfg.baseUrl, void 0, cfg.layout);
     let activeSessionId;
     let conversationMessages = [];
     const getSessionId = () => activeSessionId;

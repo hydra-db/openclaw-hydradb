@@ -1,7 +1,9 @@
 <!--
   This file is the SHARED HydraDB client contract (PRO-1298).
-  The master copy is maintained centrally and committed verbatim to all four client repos:
-    hydradb-cli · hydradb-mcp · openclaw-hydradb · hydradb-claude-code
+  The master copy is maintained centrally and committed verbatim to all four client repos,
+  which form two groups (see §0):
+    Group 1 (agent plugins):  hydradb-claude-code · openclaw-hydradb
+    Group 2 (direct clients): hydradb-cli · hydradb-mcp
   Do not edit a single repo's copy in isolation. A change is one PR per repo against this one text.
 -->
 
@@ -18,6 +20,35 @@ that churn from reaching users. It is the reason we pin the SDK **exactly**, nev
 
 ---
 
+## 0. Client groups
+
+The four clients are organised into **two groups**. A client belongs to exactly one.
+
+| Group | Clients | What they are |
+|---|---|---|
+| **Group 1** | `hydradb-claude-code` (Claude Code plugin) · `openclaw-hydradb` (OpenClaw plugin) | **Agent plugins.** They extend a host agent that is already running. HydraDB is reached through skills, slash commands and agent tools; the end user never invokes them directly. |
+| **Group 2** | `hydradb-cli` · `hydradb-mcp` | **Direct clients.** A person or a program drives them on purpose — a terminal command, or an MCP server a host connects to. Their surface is the product. |
+
+Groups are the unit of coordination. A change that alters a shared surface is landed
+across **every client in the group together**, so the two clients in a group never
+disagree in a release. Concretely:
+
+- **Group 1** shares the plugin idiom: slash-command names, skill front-matter, and the
+  `--json` state shapes marketplace-shipped skill files parse. A rename in one is a rename
+  in both.
+- **Group 2** shares the *invocation* surface: command and tool names, flag and parameter
+  spelling, and the `--output json` / `structuredContent` shapes that `jq` and MCP hosts
+  parse. When both clients expose the same capability they expose it the same way — the
+  same verbs, the same scope flags, the same defaults.
+
+This does **not** relax anything below. §1's vocabulary, §2's wrapper rules and §3's alias
+policy bind every client in both groups. Groups say who moves together, not who is exempt.
+
+Where a capability exists in only one group, that is a deliberate product decision and is
+recorded as such, not treated as drift for the other group to catch up on.
+
+---
+
 ## 1. Canonical vocabulary
 
 ### Nouns
@@ -29,6 +60,7 @@ that churn from reaching users. It is the reason we pin the SDK **exactly**, nev
 | **context** | the stored-unit family (memory + knowledge) | — |
 | **memory** | a context item of kind `memory` | user memory, preference |
 | **knowledge** | a context item of kind `knowledge` | document, file, source-as-kind |
+| **unified** | the one kind of a database created with `type: "unified"` (PRO-1618); the only kind such a database accepts, and its default. Clients read the layout from `GET /databases` `details[]` and default to it there | — |
 | **source** | one ingested item; its identifier field is `id` | source_id, file_id, doc_id |
 | **chunk** | one retrieved fragment of a source | — |
 
@@ -50,6 +82,7 @@ project directory) and must never denote a database, collection, or org.
 | **inspect** | fetch content, get content, fetch_content |
 | **delete** | remove, forget |
 | **relations** | graph_relations, graph_relations_by_id |
+| **subgraph** | source_subgraph, connected subgraph, thread (as a graph read) — Group 2 only |
 
 ### The `status` disambiguation (mandatory)
 
@@ -102,7 +135,13 @@ current SDK method internally. Language casing: `snake_case` in Python, `camelCa
 | `context.inspect(database, id, …)` | `context.inspect(…)` | was "fetch content" |
 | `context.ingestionStatus(database, ids)` | `context.status(…)` | **renamed away from `status`** |
 | `context.relations(database, id?, …)` | `context.relations(…)` | — |
+| `context.subgraph(database, id, depth?, maxSources?)` | *(none — raw `GET /context/{id}/subgraph`)* | connected subgraph; **no SDK resource yet** |
 | `context.delete(database, ids, kind)` | `context.delete(…)` | one path for memory + knowledge |
+| `graph.query(database, collection, query, params?)` | *(none — raw `POST /byog/query`)* | BYOG Cypher; **no SDK resource at 2.1.2** |
+| `graph.createDatabase(database)` | *(none — raw `POST /byog/databases`)* | — |
+| `graph.collections(database)` | *(none — raw `GET /byog/collections`)* | — |
+| `graph.dropCollection(database, collection)` | *(none — raw `DELETE /byog/collections`)* | idempotent |
+| `graph.dropDatabase(database)` | *(none — raw `DELETE /byog/databases`)* | `deleted:false` ⇒ collections only |
 
 Rules every wrapper obeys:
 
@@ -114,11 +153,47 @@ Rules every wrapper obeys:
 3. **Own env/config.** Both SDKs read zero environment variables; the wrapper supplies `token`,
    `base_url`, database, collection from config per §1.
 4. **Translate errors** back into the host client's existing error type/shape. Do not let raw SDK
-   exception types leak to surfaces that previously saw the client's own error.
+   exception types leak to surfaces that previously saw the client's own error. An error's
+   **message** and its **path** are part of that shape — see *Errors are interface* below.
 5. **Preserve host behaviour** the SDK does not provide (redaction, silent-failure, retries capped
    under hook budgets, defaults, output shapes). These are listed per-client in the plan.
 6. **Send `API-Version: 2`.** (The SDK does this; a client that previously sent no version header is
    changing server behaviour by adopting it — that is intended, but must be tested, not assumed.)
+7. **A hand-rolled path is still the wrapper.** Some endpoints have no SDK resource — BYOG
+   (`/byog/*`) has none at `2.1.2`. Those are called directly, but from *inside* the wrapper and
+   behind the same surface: same envelope-by-shape unwrapping, same `API-Version: 2` header, same
+   translated error type. A caller must not be able to tell which methods went through the SDK.
+   When the SDK grows the resource, only that one file changes. This does not weaken rule 1 — an
+   endpoint the SDK does not expose has no generated name to be insulated from.
+
+### Errors are interface, not diagnostics
+
+An agent tool propagates a failed call, so an error's **message** reaches the model, and a client
+that recovers from a failure branches on its **path**. Both are interface. Changing either is a
+client-visible change that needs a test — never a copy edit, on the server side or the client side.
+
+Two things about this are counter-intuitive, and both cost us a round when we met them:
+
+- **An error code is not automatically the discriminator.** `CORPUS_TYPE_UNSUPPORTED` covers six
+  refusals that point in different directions: two mean "retry as unified", four mean the caller
+  must change something else, and retrying one of those four pins a split database to the wrong
+  corpus for the life of the process. The code narrows to the family; the **message** decides which
+  member. So the message text is load-bearing precisely *because* the code is not sufficient.
+- **A value that varies per request cannot be matched on.** A GET carries its scope in the query
+  string, so the request URL differs every call. The **operation path** (`/context/relations`) and
+  the request URL must stay separate: the transport sends the URL, the error reports the operation
+  path. Otherwise anything branching on `path` silently stops working for those calls only — and
+  the varying URL leaks database, collection and item ids to the model as a bonus.
+
+Four instances so far. Each is now held by a test rather than by convention, on both sides of the
+wire where a server string is involved:
+
+| The string | Held by |
+|---|---|
+| The layout-refusal wording (six messages, two directions) | server `TestCorpusRefusalWordingIsAClientContract`; client tables over the same six verbatim |
+| The layout-aware `all`-on-ingest advice, which puts "This database is unified" inside a refusal that must **not** be retried | the same client tables — siblings are excluded *before* the code is read |
+| The error prefix (`Hydra <path> → …`, not the MCP wrapper's `Hydra DB …`) | client test pinning both raw branches |
+| The error path (operation path, never the request URL) | client test asserting the stable path and that the wire call still sends the real scope |
 
 ---
 
@@ -139,6 +214,7 @@ skill files and persisted to `state.json`; the CLI's `--output json` is a docume
 | `hydradb_list` | `hydra_db_list_memories`, `hydra_db_list_sources` |
 | `hydradb_inspect` | `hydra_db_fetch_content` |
 | `hydradb_delete` | `hydra_db_delete_memory` |
+| `hydradb_subgraph` | — (new in PRO-1848; no prior spelling) |
 
 ### OpenClaw (agent tool / slash / CLI — align all three)
 
@@ -160,6 +236,7 @@ skill files and persisted to `state.json`; the CLI's `--output json` is a docume
 | `hydradb list …` | `memories list`, `fetch sources` |
 | `hydradb inspect …` | `fetch content` |
 | `hydradb relations …` | `fetch relations` |
+| `hydradb subgraph <id>` | — (new in PRO-1848; no prior spelling) |
 | `hydradb delete …` | `memories delete`, `knowledge delete` |
 | `hydradb doctor` | `whoami` (config half) |
 
