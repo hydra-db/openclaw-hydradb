@@ -51,8 +51,31 @@ const RETRY_STATUSES = new Set([408, 429, 500, 502, 503, 504])
  */
 const REPLAY_UNSAFE_WRITES = new Set(["/context/ingest", "/databases"])
 
-function isReplayUnsafe(method: string, path: string): boolean {
-	return method === "POST" && REPLAY_UNSAFE_WRITES.has(path)
+function isReplayUnsafe(method: string, operationPath: string): boolean {
+	return method === "POST" && REPLAY_UNSAFE_WRITES.has(operationPath)
+}
+
+/**
+ * The stable OPERATION path behind a request URL — `/context/relations` for
+ * `/context/relations?database=…&id=…`.
+ *
+ * A GET carries its scope in the query string, so the URL a caller hands the
+ * transport varies per request: database, collection, item id, cursor. That URL
+ * is fine to SEND and wrong to keep, for two reasons:
+ *
+ *   - it lands in `HydraWrapperError.path` and in the message, both of which
+ *     reach an agent tool and therefore the model, exposing the caller's scope
+ *     and ids in what should be a diagnostic
+ *   - `path` is the field the error contract is keyed on, and a value that
+ *     varies per request cannot be matched on, so anything branching on it
+ *     silently stops working for exactly the unified GET calls
+ *
+ * Deriving it here rather than asking each call site to pass it means a caller
+ * that builds a URL cannot leak one by forgetting.
+ */
+function operationPathOf(path: string): string {
+	const queryStart = path.indexOf("?")
+	return queryStart === -1 ? path : path.slice(0, queryStart)
 }
 
 export class RawHttp {
@@ -74,16 +97,19 @@ export class RawHttp {
 	 * write that cannot be safely replayed. See REPLAY_UNSAFE_WRITES.
 	 */
 	async request<T>(method: "GET" | "POST" | "DELETE", path: string, body?: unknown): Promise<T> {
+		// `path` is the URL to send; `operationPath` is the stable half of it —
+		// the only one that may reach an error, or be matched on.
+		const operationPath = operationPathOf(path)
 		let lastErr: unknown
 		for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
 			try {
-				return await this.once<T>(method, path, body)
+				return await this.once<T>(method, path, body, operationPath)
 			} catch (err) {
 				lastErr = err
 				const retryable =
 					err instanceof HydraWrapperError &&
 					(err.status == null
-						? !isReplayUnsafe(method, path)
+						? !isReplayUnsafe(method, operationPath)
 						: RETRY_STATUSES.has(err.status))
 				if (!retryable || attempt === this.maxRetries) throw err
 				await new Promise((resolve) => setTimeout(resolve, Math.min(250 * 2 ** attempt, 2000)))
@@ -92,7 +118,12 @@ export class RawHttp {
 		throw lastErr
 	}
 
-	private async once<T>(method: "GET" | "POST" | "DELETE", path: string, body?: unknown): Promise<T> {
+	private async once<T>(
+		method: "GET" | "POST" | "DELETE",
+		path: string,
+		body: unknown,
+		operationPath: string,
+	): Promise<T> {
 		const controller = new AbortController()
 		const timer = setTimeout(() => controller.abort(), this.timeoutMs)
 		try {
@@ -119,10 +150,11 @@ export class RawHttp {
 					parsed && typeof parsed === "object"
 						? JSON.stringify(parsed)
 						: String(parsed ?? "")
-				throw new HydraWrapperError(`Hydra ${path} → ${response.status}: ${detail}`, path, {
-					status: response.status,
-					body: parsed,
-				})
+				throw new HydraWrapperError(
+					`Hydra ${operationPath} → ${response.status}: ${detail}`,
+					operationPath,
+					{ status: response.status, body: parsed },
+				)
 			}
 			return unwrap<T>(parsed)
 		} catch (err) {
@@ -133,7 +165,9 @@ export class RawHttp {
 					: err instanceof Error
 						? err.message
 						: String(err)
-			throw new HydraWrapperError(`Hydra ${path} → ERR: ${reason}`, path, { cause: err })
+			throw new HydraWrapperError(`Hydra ${operationPath} → ERR: ${reason}`, operationPath, {
+				cause: err,
+			})
 		} finally {
 			clearTimeout(timer)
 		}

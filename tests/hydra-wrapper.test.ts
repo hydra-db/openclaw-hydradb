@@ -384,3 +384,47 @@ test("raw errors use OpenClaw's `Hydra …` template, not the MCP `Hydra DB …`
 		},
 	)
 })
+
+// A unified GET carries its scope in the query string, so the URL handed to the
+// transport varies per request: database, collection, item id, cursor. That URL
+// is fine to SEND and wrong to keep — it reaches an agent tool, and therefore
+// the model, through both `HydraWrapperError.path` and the message. `path` is
+// also the field the error contract is keyed on, so a per-request value cannot
+// be matched on and anything branching on it silently stops working for exactly
+// the unified GET calls. Both halves are pinned here.
+test("a failing unified relations call reports the operation path, not the request URL", async () => {
+	let sentUrl = ""
+	const failing = ((url: string | URL | Request) => {
+		sentUrl = String(url)
+		return Promise.resolve(
+			new Response(JSON.stringify({ success: false, error: { message: "nope" } }), {
+				status: 400,
+				headers: { "content-type": "application/json" },
+			}),
+		)
+	}) as typeof fetch
+	const hydra = new HydraDB(
+		{ token: "t", database: "db_secret", collection: "col_secret", baseUrl: "https://api.test", fetch: failing },
+		{} as HydraDBClient,
+	)
+
+	await assert.rejects(
+		() => hydra.context.relations({ kind: "unified", id: "src_private_123", limit: 5 }),
+		(err: unknown) => {
+			assert.ok(err instanceof HydraWrapperError)
+			assert.equal(err.path, "/context/relations", "path must be the stable operation path")
+			assert.match(err.message, /^Hydra \/context\/relations → 400: /)
+			for (const secret of ["db_secret", "col_secret", "src_private_123", "limit"]) {
+				assert.ok(
+					!err.message.includes(secret),
+					`the message must not expose ${secret} to an agent tool`,
+				)
+			}
+			return true
+		},
+	)
+
+	// The request itself still carries the full URL — only the error is trimmed.
+	assert.match(sentUrl, /\/context\/relations\?/)
+	assert.ok(sentUrl.includes("src_private_123"), "the wire call still sends the real scope")
+})

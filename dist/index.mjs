@@ -206,8 +206,12 @@ function translateError(path2, err) {
 var DEFAULT_BASE_URL = "https://api.hydradb.com";
 var RETRY_STATUSES = /* @__PURE__ */ new Set([408, 429, 500, 502, 503, 504]);
 var REPLAY_UNSAFE_WRITES = /* @__PURE__ */ new Set(["/context/ingest", "/databases"]);
-function isReplayUnsafe(method, path2) {
-  return method === "POST" && REPLAY_UNSAFE_WRITES.has(path2);
+function isReplayUnsafe(method, operationPath) {
+  return method === "POST" && REPLAY_UNSAFE_WRITES.has(operationPath);
+}
+function operationPathOf(path2) {
+  const queryStart = path2.indexOf("?");
+  return queryStart === -1 ? path2 : path2.slice(0, queryStart);
 }
 var RawHttp = class {
   constructor(config) {
@@ -228,20 +232,21 @@ var RawHttp = class {
    * write that cannot be safely replayed. See REPLAY_UNSAFE_WRITES.
    */
   async request(method, path2, body) {
+    const operationPath = operationPathOf(path2);
     let lastErr;
     for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
       try {
-        return await this.once(method, path2, body);
+        return await this.once(method, path2, body, operationPath);
       } catch (err) {
         lastErr = err;
-        const retryable = err instanceof HydraWrapperError && (err.status == null ? !isReplayUnsafe(method, path2) : RETRY_STATUSES.has(err.status));
+        const retryable = err instanceof HydraWrapperError && (err.status == null ? !isReplayUnsafe(method, operationPath) : RETRY_STATUSES.has(err.status));
         if (!retryable || attempt === this.maxRetries) throw err;
         await new Promise((resolve) => setTimeout(resolve, Math.min(250 * 2 ** attempt, 2e3)));
       }
     }
     throw lastErr;
   }
-  async once(method, path2, body) {
+  async once(method, path2, body, operationPath) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
     try {
@@ -265,16 +270,19 @@ var RawHttp = class {
       }
       if (!response.ok) {
         const detail = parsed && typeof parsed === "object" ? JSON.stringify(parsed) : String(parsed ?? "");
-        throw new HydraWrapperError(`Hydra ${path2} \u2192 ${response.status}: ${detail}`, path2, {
-          status: response.status,
-          body: parsed
-        });
+        throw new HydraWrapperError(
+          `Hydra ${operationPath} \u2192 ${response.status}: ${detail}`,
+          operationPath,
+          { status: response.status, body: parsed }
+        );
       }
       return unwrap(parsed);
     } catch (err) {
       if (err instanceof HydraWrapperError) throw err;
       const reason = err instanceof Error && err.name === "AbortError" ? `timed out after ${this.timeoutMs}ms` : err instanceof Error ? err.message : String(err);
-      throw new HydraWrapperError(`Hydra ${path2} \u2192 ERR: ${reason}`, path2, { cause: err });
+      throw new HydraWrapperError(`Hydra ${operationPath} \u2192 ERR: ${reason}`, operationPath, {
+        cause: err
+      });
     } finally {
       clearTimeout(timer);
     }
