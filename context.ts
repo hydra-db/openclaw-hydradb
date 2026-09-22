@@ -1,9 +1,59 @@
+import { isUnifiedQueryResponse } from "./hydra/unified.ts"
 import type {
 	PathTriplet,
 	RecallResponse,
 	ScoredPath,
+	UnifiedQueryResponse,
 	VectorChunk,
 } from "./types/hydra.ts"
+
+/**
+ * Whether a recall has nothing to show. Split: no chunks, as before. Unified
+ * (PRO-1618): a blank `llm_prompt`, which is what the server sends when
+ * chunks, graph and relations are all empty; a graph-only answer still renders.
+ */
+export function recallIsEmpty(response: RecallResponse): boolean {
+	if (isUnifiedQueryResponse(response)) return response.llm_prompt.trim() === ""
+	return !response.chunks || response.chunks.length === 0
+}
+
+/**
+ * The structured lines a user-facing surface (slash command, CLI) prints for a
+ * unified result (PRO-1618), read from the contract's own fields:
+ * `chunks[].context_id` / `score` / `content` / `enrichment.text`, then
+ * `graph[].path_summary`, then `relations[]`. The split surfaces keep their
+ * own line formats untouched.
+ */
+export function unifiedRecallLines(
+	response: UnifiedQueryResponse,
+	opts: { maxChunks: number; preview: (text: string) => string },
+): string[] {
+	const lines: string[] = []
+	response.chunks.slice(0, opts.maxChunks).forEach((chunk, i) => {
+		lines.push(
+			`${i + 1}. [${chunk.context_id}] ${opts.preview(chunk.content)} (${Math.round(chunk.score * 100)}%)`,
+		)
+		if (chunk.enrichment?.text) lines.push(`   ${opts.preview(chunk.enrichment.text)}`)
+	})
+	if (response.graph.length > 0) {
+		lines.push("Graph:")
+		for (const path of response.graph) {
+			const summary =
+				path.path_summary ||
+				path.triplets
+					.map((t) => `${t.source.name} -> ${t.relation.predicate} -> ${t.target.name}`)
+					.join("; ")
+			if (summary) lines.push(`- ${summary}`)
+		}
+	}
+	if (response.relations.length > 0) {
+		lines.push("Related:")
+		for (const rel of response.relations) {
+			lines.push(`- [${rel.via.from} -> ${rel.via.to}] ${opts.preview(rel.chunk.content)}`)
+		}
+	}
+	return lines
+}
 
 function formatTriplet(triplet: PathTriplet): string {
 	const src = triplet.source?.name ?? "?"
@@ -22,6 +72,11 @@ export function buildRecalledContext(
 		minEvidenceScore?: number
 	},
 ): string {
+	// PRO-1618: a unified database ships its own rendering. `llm_prompt` is the
+	// server-built, citation-labelled string the contract says to surface to
+	// the agent verbatim, so nothing is rebuilt from chunks[] / graph[] here.
+	if (isUnifiedQueryResponse(response)) return response.llm_prompt
+
 	const minScore = opts?.minEvidenceScore ?? 0.4
 
 	const chunks = response.chunks ?? []

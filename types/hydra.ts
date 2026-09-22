@@ -1,3 +1,14 @@
+import type { UnifiedQueryResponse } from "../hydra/unified.ts"
+
+// PRO-1618: the unified wire shapes are owned by the wrapper; re-exported so
+// the surfaces can name them without reaching into hydra/.
+export type {
+	UnifiedChunk,
+	UnifiedGraphPath,
+	UnifiedQueryResponse,
+	UnifiedRelation,
+} from "../hydra/unified.ts"
+
 export type ConversationTurn = {
 	user: string
 	assistant: string
@@ -25,11 +36,13 @@ export type AddMemoryRequest = {
 }
 
 export type MemoryResultItem = {
+	/** On a unified database (PRO-1618) this IS the item's context_id; the row keeps the old spelling. */
 	source_id: string
 	title?: string | null
 	status: string
 	infer: boolean
 	error?: string | null
+	error_code?: string | null
 }
 
 export type AddMemoryResponse = {
@@ -93,11 +106,20 @@ export type GraphContext = {
 	chunk_id_to_group_ids: Record<string, string[]>
 }
 
-export type RecallResponse = {
+/** The legacy recall shape a SPLIT database answers with (graph_context, chunk_content). */
+export type SplitRecallResponse = {
 	chunks: VectorChunk[]
 	graph_context?: GraphContext
 	additional_context?: Record<string, VectorChunk>
 }
+
+/**
+ * What `HydraClient.recall` resolves to. A split database yields the legacy
+ * shape, unchanged; a unified database (PRO-1618) yields the contract's
+ * four-key body exactly as it came off the wire. The two are told apart by
+ * shape with `isUnifiedQueryResponse` (hydra/), never by a flag.
+ */
+export type RecallResponse = SplitRecallResponse | UnifiedQueryResponse
 
 // --- List API ---
 

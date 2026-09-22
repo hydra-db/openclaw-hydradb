@@ -1,6 +1,6 @@
 import type { HydraClient } from "../client.ts"
 import type { HydraPluginConfig } from "../config.ts"
-import { buildRecalledContext, envelopeForInjection } from "../context.ts"
+import { buildRecalledContext, envelopeForInjection, recallIsEmpty } from "../context.ts"
 import { log } from "../log.ts"
 import { containsIgnoreTerm } from "../messages.ts"
 
@@ -26,11 +26,13 @@ export function createRecallHook(
 				graphContext: cfg.graphContext,
 			})
 
-			if (!response.chunks || response.chunks.length === 0) {
+			if (recallIsEmpty(response)) {
 				log.debug("no memories matched")
 				return
 			}
 
+			// On a unified database this is the server's `llm_prompt`, verbatim
+			// (PRO-1618); on a split one it is the legacy rendering, unchanged.
 			const body = buildRecalledContext(response)
 			if (!body.trim()) return
 

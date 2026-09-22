@@ -4,6 +4,8 @@ import type { HydraPluginConfig } from "./config.ts"
 import { registerOnboardingCli as createOnboardingCliRegistrar, registerOnboardingSlashCommands } from "./commands/onboarding.ts"
 import { registerSlashCommands } from "./commands/slash.ts"
 import { hydraConfigSchema, tryParseConfig } from "./config.ts"
+import { recallIsEmpty, unifiedRecallLines } from "./context.ts"
+import { isUnifiedQueryResponse } from "./hydra/index.ts"
 import { createIngestionHook } from "./hooks/capture.ts"
 import { createRecallHook } from "./hooks/recall.ts"
 import { log } from "./log.ts"
@@ -143,8 +145,19 @@ async function queryAction(ctx: CliCtx, query: string, opts: { limit: string }):
 		graphContext: ctx.cfg.graphContext,
 	})
 
-	if (!res.chunks || res.chunks.length === 0) {
+	if (recallIsEmpty(res)) {
 		console.log("No memories found.")
+		return
+	}
+
+	// PRO-1618: a unified result is read from the contract's own fields; the
+	// split rendering below is untouched.
+	if (isUnifiedQueryResponse(res)) {
+		const lines = unifiedRecallLines(res, {
+			maxChunks: res.chunks.length,
+			preview: (t) => t.slice(0, 200),
+		})
+		for (const line of lines) console.log(line)
 		return
 	}
 

@@ -29,3 +29,18 @@ export {
 	CORPUS_TYPE_UNSUPPORTED_CODE,
 } from "./errors.ts"
 export { unwrap } from "./envelope.ts"
+// PRO-1618: the unified database wire contract and its shape guards.
+export type { IngestResult, QueryResult } from "./client.ts"
+export type {
+	UnifiedChunk,
+	UnifiedConversationTurn,
+	UnifiedGraphPath,
+	UnifiedIngestItem,
+	UnifiedIngestRequest,
+	UnifiedIngestResponse,
+	UnifiedIngestResultItem,
+	UnifiedQueryResponse,
+	UnifiedRelation,
+	UnifiedTriplet,
+} from "./unified.ts"
+export { isUnifiedIngestResponse, isUnifiedQueryResponse } from "./unified.ts"

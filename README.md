@@ -112,7 +112,7 @@ openclaw gateway restart
 
 ## How It Works
 
-- **Unified databases** (PRO-1618): a database created with `type: "unified"` keeps knowledge and memory in one corpus and refuses `type: memory`. With `layout: "auto"` the plugin reads the layout from `GET /databases` once and sends `unified` there, ingesting through the `items[]` shape; on a split database nothing changes.
+- **Unified databases** (PRO-1618): a database created with `type: "unified"` keeps knowledge and memory in one corpus and refuses `type: memory`. With `layout: "auto"` the plugin reads the layout from `GET /databases` once and, on a unified database, sends no `type` on any call. Captures go to `POST /context/ingest` as a JSON body whose list key is `context`: each item is either `text` or a `conversation` of `{role, content, name?}` turns, the session id is its `context_id`, and `enrich`, `upsert` and `instructions` travel at request level. The 202's `results[].source_id` is that context id. `POST /query` answers with the four-key unified body (`chunks`, `graph`, `relations`, `llm_prompt`), and the plugin injects `llm_prompt` verbatim. On a split database nothing changes.
 
 - **Auto-Recall** — Before every AI turn, queries Hydra for relevant memories and injects graph-enriched context (entity paths, chunk relations, extra context).
 - **Auto-Capture** — After every AI turn, the last user/assistant exchange is sent to Hydra as conversation pairs with `infer: true` and `upsert: true`. The session ID is used as `source_id` so Hydra groups exchanges per session and builds a knowledge graph automatically.
@@ -191,6 +191,8 @@ Recalled context is injected inside `<hydra-context>` tags containing:
 
 - **Entity Paths** — Knowledge graph paths connecting entities relevant to the query
 - **Context Chunks** — Retrieved memory chunks with source titles, graph relations, and linked extra context
+
+On a unified database (PRO-1618) the body inside the tags is instead the server-built `llm_prompt` from `POST /query`, injected verbatim: a `=== CONTEXT ===` section with citation labels (`[1]`, `[R1]`, `[P1]`), then `=== RELATED CONTEXT ===` and `=== GRAPH ===` when there is anything to show. The `hydradb_query` tool, `/hydradb-query` and `openclaw hydradb query` read the same body's `chunks[].content`, `chunks[].enrichment.text`, `graph[].path_summary` and `relations[]` for their structured output.
 
 ## Contributing / Developer Setup
 

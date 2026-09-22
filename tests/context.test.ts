@@ -1,8 +1,8 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
 
-import { buildRecalledContext } from "../context.ts"
-import type { RecallResponse } from "../types/hydra.ts"
+import { buildRecalledContext, recallIsEmpty, unifiedRecallLines } from "../context.ts"
+import type { RecallResponse, UnifiedQueryResponse } from "../types/hydra.ts"
 
 // Ported from the MCP context tests (hydradb-mcp PR #36). Only the two tests
 // that match OpenClaw's actual renderer are ported: entity paths / graph
@@ -116,4 +116,63 @@ test("buildRecalledContext filters low-score relations by default", () => {
 
 	assert.doesNotMatch(output, /Graph Relations:/)
 	assert.doesNotMatch(output, /Alice/)
+})
+
+// PRO-1618: a unified fixture (all four keys) is rendered as `llm_prompt`
+// verbatim, never rebuilt from chunks[] / graph[]; the structured summary the
+// slash command and CLI print reads the contract's own fields.
+test("buildRecalledContext returns llm_prompt verbatim for a unified body", () => {
+	const unified: UnifiedQueryResponse = {
+		chunks: [
+			{
+				chunk_id: "ck_1",
+				context_id: "chat-1",
+				score: 0.87,
+				content: "user: dark mode please",
+				enrichment: { text: "Prefers dark mode.", kind: "user_preference" },
+			},
+			{ chunk_id: "ck_2", context_id: "note-2", score: 0.4, content: "Plain note" },
+		],
+		graph: [
+			{ triplets: [], path_summary: "Ada prefers dark mode." },
+			{
+				triplets: [
+					{
+						source: { entity_id: "e1", name: "Ada" },
+						relation: { predicate: "uses", context: "", relationship_id: "r1", chunk_id: "ck_1" },
+						target: { entity_id: "e2", name: "OpenClaw" },
+					},
+				],
+				path_summary: "",
+			},
+		],
+		relations: [
+			{
+				via: { from: "linear-1", to: "linear-1-c4" },
+				chunk: { chunk_id: "ck_r", context_id: "linear-1-c4", score: 0.5, content: "Comment 4 body" },
+			},
+		],
+		llm_prompt: "=== CONTEXT ===\n[1] context_id: chat-1\nuser: dark mode please\n\n=== GRAPH ===\n[P1] Ada prefers dark mode.",
+	}
+
+	assert.equal(buildRecalledContext(unified), unified.llm_prompt)
+	assert.equal(recallIsEmpty(unified), false)
+	assert.equal(recallIsEmpty({ chunks: [], graph: [], relations: [], llm_prompt: "  \n" }), true)
+
+	assert.deepEqual(unifiedRecallLines(unified, { maxChunks: 10, preview: (t) => t }), [
+		"1. [chat-1] user: dark mode please (87%)",
+		"   Prefers dark mode.",
+		"2. [note-2] Plain note (40%)",
+		"Graph:",
+		"- Ada prefers dark mode.",
+		"- Ada -> uses -> OpenClaw",
+		"Related:",
+		"- [linear-1 -> linear-1-c4] Comment 4 body",
+	])
+})
+
+// The split emptiness rule is the one the surfaces always had: no chunks.
+test("recallIsEmpty keeps the split rule of no chunks", () => {
+	assert.equal(recallIsEmpty({ chunks: [] }), true)
+	assert.equal(recallIsEmpty({ chunks: [{ chunk_uuid: "c1", source_id: "s1", chunk_content: "x" }] }), false)
 })
