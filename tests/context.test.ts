@@ -130,9 +130,11 @@ test("buildRecalledContext returns llm_prompt verbatim for a unified body", () =
 				context_id: "chat-1",
 				score: 0.87,
 				content: "user: dark mode please",
-				enrichment: { text: "Prefers dark mode.", kind: "user_preference" },
+				enrichment: "Prefers dark mode.",
+				enrichment_kind: "user_preference",
 			},
-			{ chunk_id: "ck_2", context_id: "note-2", score: 0.4, content: "Plain note" },
+			// enrichment_kind without enrichment: no enrichment line is printed.
+			{ chunk_id: "ck_2", context_id: "note-2", score: 0.4, content: "Plain note", enrichment_kind: "business_knowledge" },
 		],
 		graph: [
 			{ origin: "query_path", triplets: [], path_summary: "Ada prefers dark mode." },
@@ -154,7 +156,10 @@ test("buildRecalledContext returns llm_prompt verbatim for a unified body", () =
 				chunk: { chunk_id: "ck_r", context_id: "linear-1-c4", score: 0.5, content: "Comment 4 body" },
 			},
 		],
-		llm_prompt: "=== CONTEXT ===\n[1] context_id: chat-1\nuser: dark mode please\n\n=== GRAPH ===\n[P1] Ada prefers dark mode.",
+		llm_prompt:
+			"# Query results\n\n**Query:** what theme does Ada use?\n\n## Results\n\n### 1. chat-1\n" +
+			"- **Relevance:** 0.87 · **Category:** user_preference\n\nuser: dark mode please\n\n" +
+			"**Enrichment:** Prefers dark mode.\n\n## Related facts\n\n- [P1] **Ada** -prefers→ **dark mode** (query path, relevance 0.80) [1]",
 	}
 
 	assert.equal(buildRecalledContext(unified), unified.llm_prompt)

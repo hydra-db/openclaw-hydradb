@@ -1,4 +1,5 @@
 import assert from "node:assert/strict"
+import { readFileSync } from "node:fs"
 import { test } from "node:test"
 
 import { HydraDBClient, HydraDBError } from "@hydradb/sdk"
@@ -213,25 +214,13 @@ test("a raw failure keeps the status and body on the error", async () => {
 // envelope's unified `meta` has no tenant_id, sub_tenant_id or source_type, and
 // the result needs none of them.
 test("unified query sends no type, carries follow_forceful_relations and returns the four-key body verbatim", async () => {
-	const unifiedBody = {
-		chunks: [
-			{
-				chunk_id: "ck_1",
-				context_id: "chat-1",
-				score: 0.87,
-				content: "user: dark mode please\nassistant: Noted.",
-				enrichment: { text: "Prefers dark mode.", kind: "user_preference" },
-			},
-		],
-		graph: [{ origin: "query_path", triplets: [], path_summary: "Ada prefers dark mode." }],
-		forceful_relations: [],
-		llm_prompt: "=== CONTEXT ===\n[1] context_id: chat-1\nuser: dark mode please\nassistant: Noted.",
-	}
-	const { fetch, calls } = fetchStub({
-		success: true,
-		data: unifiedBody,
-		meta: { request_id: "req_1", api_version: "2", latency_ms: 12, database: "db_u", collection: "c1" },
-	})
+	// A real unified envelope, exactly as the server renders it: `enrichment`
+	// is a string, `enrichment_kind` its sibling, `llm_prompt` markdown.
+	const envelope = JSON.parse(
+		readFileSync(new URL("./fixtures/unified-query-response.json", import.meta.url), "utf8"),
+	) as { data: Record<string, unknown> }
+	const unifiedBody = envelope.data
+	const { fetch, calls } = fetchStub(envelope)
 	const sdk = { query() { throw new Error("SDK query must not be used for unified") } } as unknown as HydraDBClient
 	const hydra = new HydraDB({ token: "t", database: "db_u", collection: "c1", baseUrl: "https://api.test", fetch }, sdk)
 

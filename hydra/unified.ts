@@ -17,7 +17,13 @@
  *     logs and split databases keep producing the old shape.
  */
 
-/** One chunk of a unified query result. Carries nothing about its source. */
+/** The declared context_category a unified chunk carries as `enrichment_kind`. */
+export type UnifiedEnrichmentKind = "user_preference" | "business_knowledge" | "decision_trace"
+
+/**
+ * One chunk of a unified query result. Carries nothing about its source. The
+ * same shape is the `chunk` of every `forceful_relations[]` item.
+ */
 export interface UnifiedChunk {
 	/** Was chunk_uuid. */
 	chunk_id: string
@@ -27,8 +33,13 @@ export interface UnifiedChunk {
 	score: number
 	/** The chunk's own text; enrichment is NOT concatenated any more. */
 	content: string
-	/** Absent when there is neither text nor kind; `text` may be "" when only `kind` is present. */
-	enrichment?: { text: string; kind?: string }
+	/** The enrichment text as a plain string. Omitted when empty. */
+	enrichment?: string
+	/**
+	 * The `context_category` declared at ingest. Omitted when none was
+	 * declared; may be present when `enrichment` is absent.
+	 */
+	enrichment_kind?: UnifiedEnrichmentKind
 	/** Present only when the query engaged temporal reasoning; dates may be null. */
 	temporal?: { content: string; start_date: string | null; end_date: string | null }[]
 }
@@ -81,9 +92,12 @@ export interface UnifiedQueryResponse {
 	/** [] when none, or when follow_forceful_relations=false. */
 	forceful_relations: UnifiedForcefulRelation[]
 	/**
-	 * A server-built string ready to inject into a model call, with citation
-	 * labels [1], [R1], [P1]. Clients surface it to the agent verbatim instead
-	 * of building their own string. "" when there is nothing to render.
+	 * A server-built markdown string ready to inject into a model call:
+	 * `# Query results`, then `## Results` (`### 1. <title>`, cited as [1]),
+	 * `## Forceful relations` (`### R1. <title>`), `## Related facts` ([P1]),
+	 * `## Temporal facts` and `## Sources`, each section only when it has
+	 * anything to show. Clients surface it to the agent verbatim instead of
+	 * building their own string. "" when there is nothing to render.
 	 */
 	llm_prompt: string
 }

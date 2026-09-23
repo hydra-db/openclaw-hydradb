@@ -93,7 +93,7 @@ export interface QueryParams {
 	/**
 	 * Unified database only (PRO-1618): follow the relations declared with
 	 * `forceful_relations` at ingest, which fills the response's
-	 * `forceful_relations[]` and the FORCEFUL RELATIONS section of
+	 * `forceful_relations[]` and the `## Forceful relations` section of
 	 * `llm_prompt`. Server default true. Never sent on a split database, whose
 	 * SDK request stays byte for byte as it was.
 	 */

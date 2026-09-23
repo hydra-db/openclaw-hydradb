@@ -1372,7 +1372,7 @@ function unifiedRecallLines(response, opts) {
     lines.push(
       `${i + 1}. [${chunk.context_id}] ${opts.preview(chunk.content)} (${Math.round(chunk.score * 100)}%)`
     );
-    if (chunk.enrichment?.text) lines.push(`   ${opts.preview(chunk.enrichment.text)}`);
+    if (chunk.enrichment) lines.push(`   ${opts.preview(chunk.enrichment)}`);
   });
   if (response.graph.length > 0) {
     lines.push("Graph:");

@@ -34,6 +34,7 @@ export type { IngestResult, QueryResult } from "./client.ts"
 export type {
 	UnifiedChunk,
 	UnifiedConversationTurn,
+	UnifiedEnrichmentKind,
 	UnifiedForcefulRelation,
 	UnifiedGraphPath,
 	UnifiedGraphPathOrigin,

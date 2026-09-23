@@ -21,7 +21,7 @@ export function recallIsEmpty(response: RecallResponse): boolean {
 /**
  * The structured lines a user-facing surface (slash command, CLI) prints for a
  * unified result (PRO-1618), read from the contract's own fields:
- * `chunks[].context_id` / `score` / `content` / `enrichment.text`, then
+ * `chunks[].context_id` / `score` / `content` / `enrichment`, then
  * `graph[].path_summary`, then `forceful_relations[]`. The split surfaces keep
  * their own line formats untouched.
  */
@@ -34,7 +34,7 @@ export function unifiedRecallLines(
 		lines.push(
 			`${i + 1}. [${chunk.context_id}] ${opts.preview(chunk.content)} (${Math.round(chunk.score * 100)}%)`,
 		)
-		if (chunk.enrichment?.text) lines.push(`   ${opts.preview(chunk.enrichment.text)}`)
+		if (chunk.enrichment) lines.push(`   ${opts.preview(chunk.enrichment)}`)
 	})
 	if (response.graph.length > 0) {
 		lines.push("Graph:")

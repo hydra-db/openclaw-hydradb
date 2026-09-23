@@ -209,8 +209,8 @@ export class HydraClient {
 			recencyBias?: number
 			/**
 			 * Unified database only (PRO-1618): follow the relations declared at
-			 * ingest, filling `forceful_relations[]` and the FORCEFUL RELATIONS
-			 * section of `llm_prompt`. Default true. Never sent on a split
+			 * ingest, filling `forceful_relations[]` and the `## Forceful
+			 * relations` section of `llm_prompt`. Default true. Never sent on a split
 			 * database.
 			 */
 			followForcefulRelations?: boolean
