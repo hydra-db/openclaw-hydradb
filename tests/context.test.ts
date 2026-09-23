@@ -2,6 +2,7 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 
 import { buildRecalledContext, recallIsEmpty, unifiedRecallLines } from "../context.ts"
+import { isUnifiedQueryResponse } from "../hydra/unified.ts"
 import type { RecallResponse, UnifiedQueryResponse } from "../types/hydra.ts"
 
 // Ported from the MCP context tests (hydradb-mcp PR #36). Only the two tests
@@ -134,8 +135,9 @@ test("buildRecalledContext returns llm_prompt verbatim for a unified body", () =
 			{ chunk_id: "ck_2", context_id: "note-2", score: 0.4, content: "Plain note" },
 		],
 		graph: [
-			{ triplets: [], path_summary: "Ada prefers dark mode." },
+			{ origin: "query_path", triplets: [], path_summary: "Ada prefers dark mode." },
 			{
+				origin: "chunk_relation",
 				triplets: [
 					{
 						source: { entity_id: "e1", name: "Ada" },
@@ -146,7 +148,7 @@ test("buildRecalledContext returns llm_prompt verbatim for a unified body", () =
 				path_summary: "",
 			},
 		],
-		relations: [
+		forceful_relations: [
 			{
 				via: { from: "linear-1", to: "linear-1-c4" },
 				chunk: { chunk_id: "ck_r", context_id: "linear-1-c4", score: 0.5, content: "Comment 4 body" },
@@ -157,7 +159,7 @@ test("buildRecalledContext returns llm_prompt verbatim for a unified body", () =
 
 	assert.equal(buildRecalledContext(unified), unified.llm_prompt)
 	assert.equal(recallIsEmpty(unified), false)
-	assert.equal(recallIsEmpty({ chunks: [], graph: [], relations: [], llm_prompt: "  \n" }), true)
+	assert.equal(recallIsEmpty({ chunks: [], graph: [], forceful_relations: [], llm_prompt: "  \n" }), true)
 
 	assert.deepEqual(unifiedRecallLines(unified, { maxChunks: 10, preview: (t) => t }), [
 		"1. [chat-1] user: dark mode please (87%)",
@@ -166,9 +168,19 @@ test("buildRecalledContext returns llm_prompt verbatim for a unified body", () =
 		"Graph:",
 		"- Ada prefers dark mode.",
 		"- Ada -> uses -> OpenClaw",
-		"Related:",
+		"Forceful relations:",
 		"- [linear-1 -> linear-1-c4] Comment 4 body",
 	])
+})
+
+// The root key is `forceful_relations`. A body that still says `relations` is
+// not the unified contract, and there is no fallback that reads the old key.
+test("a body with the pre-rename `relations` key is not a unified response", () => {
+	const renamed = { chunks: [], graph: [], forceful_relations: [], llm_prompt: "x" }
+	const preRename = { chunks: [], graph: [], relations: [], llm_prompt: "x" }
+	assert.equal(isUnifiedQueryResponse(renamed), true)
+	assert.equal(isUnifiedQueryResponse(preRename), false)
+	assert.equal(isUnifiedQueryResponse({ ...renamed, forceful_relations: null }), false)
 })
 
 // The split emptiness rule is the one the surfaces always had: no chunks.

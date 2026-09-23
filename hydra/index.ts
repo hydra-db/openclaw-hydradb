@@ -34,13 +34,14 @@ export type { IngestResult, QueryResult } from "./client.ts"
 export type {
 	UnifiedChunk,
 	UnifiedConversationTurn,
+	UnifiedForcefulRelation,
 	UnifiedGraphPath,
+	UnifiedGraphPathOrigin,
 	UnifiedIngestItem,
 	UnifiedIngestRequest,
 	UnifiedIngestResponse,
 	UnifiedIngestResultItem,
 	UnifiedQueryResponse,
-	UnifiedRelation,
 	UnifiedTriplet,
 } from "./unified.ts"
 export { isUnifiedIngestResponse, isUnifiedQueryResponse } from "./unified.ts"

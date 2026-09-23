@@ -92,9 +92,10 @@ export interface QueryParams {
 	recencyBias?: number
 	/**
 	 * Unified database only (PRO-1618): follow the relations declared with
-	 * `forceful_relations` at ingest, which fills `relations[]` and the RELATED
-	 * CONTEXT section of `llm_prompt`. Server default true. Never sent on a
-	 * split database, whose SDK request stays byte for byte as it was.
+	 * `forceful_relations` at ingest, which fills the response's
+	 * `forceful_relations[]` and the FORCEFUL RELATIONS section of
+	 * `llm_prompt`. Server default true. Never sent on a split database, whose
+	 * SDK request stays byte for byte as it was.
 	 */
 	followForcefulRelations?: boolean
 	/** Per-call collection override. */

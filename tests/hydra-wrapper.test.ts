@@ -209,7 +209,9 @@ test("a raw failure keeps the status and body on the error", async () => {
 
 // PRO-1618: a unified query sends NO `type` (absent is the unified default;
 // memory and knowledge are 400 there), carries follow_forceful_relations, and
-// gets the contract's four-key body back exactly as it came off the wire.
+// gets the contract's four-key body back exactly as it came off the wire. The
+// envelope's unified `meta` has no tenant_id, sub_tenant_id or source_type, and
+// the result needs none of them.
 test("unified query sends no type, carries follow_forceful_relations and returns the four-key body verbatim", async () => {
 	const unifiedBody = {
 		chunks: [
@@ -221,11 +223,15 @@ test("unified query sends no type, carries follow_forceful_relations and returns
 				enrichment: { text: "Prefers dark mode.", kind: "user_preference" },
 			},
 		],
-		graph: [{ triplets: [], path_summary: "Ada prefers dark mode." }],
-		relations: [],
+		graph: [{ origin: "query_path", triplets: [], path_summary: "Ada prefers dark mode." }],
+		forceful_relations: [],
 		llm_prompt: "=== CONTEXT ===\n[1] context_id: chat-1\nuser: dark mode please\nassistant: Noted.",
 	}
-	const { fetch, calls } = fetchStub({ success: true, data: unifiedBody })
+	const { fetch, calls } = fetchStub({
+		success: true,
+		data: unifiedBody,
+		meta: { request_id: "req_1", api_version: "2", latency_ms: 12, database: "db_u", collection: "c1" },
+	})
 	const sdk = { query() { throw new Error("SDK query must not be used for unified") } } as unknown as HydraDBClient
 	const hydra = new HydraDB({ token: "t", database: "db_u", collection: "c1", baseUrl: "https://api.test", fetch }, sdk)
 

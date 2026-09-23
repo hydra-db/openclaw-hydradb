@@ -10,7 +10,8 @@ import type {
 /**
  * Whether a recall has nothing to show. Split: no chunks, as before. Unified
  * (PRO-1618): a blank `llm_prompt`, which is what the server sends when
- * chunks, graph and relations are all empty; a graph-only answer still renders.
+ * chunks, graph and forceful_relations are all empty; a graph-only answer
+ * still renders.
  */
 export function recallIsEmpty(response: RecallResponse): boolean {
 	if (isUnifiedQueryResponse(response)) return response.llm_prompt.trim() === ""
@@ -21,8 +22,8 @@ export function recallIsEmpty(response: RecallResponse): boolean {
  * The structured lines a user-facing surface (slash command, CLI) prints for a
  * unified result (PRO-1618), read from the contract's own fields:
  * `chunks[].context_id` / `score` / `content` / `enrichment.text`, then
- * `graph[].path_summary`, then `relations[]`. The split surfaces keep their
- * own line formats untouched.
+ * `graph[].path_summary`, then `forceful_relations[]`. The split surfaces keep
+ * their own line formats untouched.
  */
 export function unifiedRecallLines(
 	response: UnifiedQueryResponse,
@@ -46,9 +47,9 @@ export function unifiedRecallLines(
 			if (summary) lines.push(`- ${summary}`)
 		}
 	}
-	if (response.relations.length > 0) {
-		lines.push("Related:")
-		for (const rel of response.relations) {
+	if (response.forceful_relations.length > 0) {
+		lines.push("Forceful relations:")
+		for (const rel of response.forceful_relations) {
 			lines.push(`- [${rel.via.from} -> ${rel.via.to}] ${opts.preview(rel.chunk.content)}`)
 		}
 	}

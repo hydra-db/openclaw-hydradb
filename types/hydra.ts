@@ -4,9 +4,10 @@ import type { UnifiedQueryResponse } from "../hydra/unified.ts"
 // the surfaces can name them without reaching into hydra/.
 export type {
 	UnifiedChunk,
+	UnifiedForcefulRelation,
 	UnifiedGraphPath,
+	UnifiedGraphPathOrigin,
 	UnifiedQueryResponse,
-	UnifiedRelation,
 } from "../hydra/unified.ts"
 
 export type ConversationTurn = {

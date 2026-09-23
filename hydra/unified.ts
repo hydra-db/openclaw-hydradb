@@ -45,8 +45,15 @@ export interface UnifiedTriplet {
 	target: { entity_id: string; name: string }
 }
 
+/**
+ * Where a graph path came from: `query_path` was grown from the query's
+ * entities, `chunk_relation` is the neighbourhood of a returned chunk.
+ */
+export type UnifiedGraphPathOrigin = "query_path" | "chunk_relation"
+
 /** One graph path: query paths first, then chunk expansions; deduplicated. */
 export interface UnifiedGraphPath {
+	origin: UnifiedGraphPathOrigin
 	triplets: UnifiedTriplet[]
 	path_summary: string
 }
@@ -56,22 +63,23 @@ export interface UnifiedGraphPath {
  * `via.to` is the returned chunk's own context_id; `via.from` is the context
  * whose declared relation pulled it in (may be "").
  */
-export interface UnifiedRelation {
+export interface UnifiedForcefulRelation {
 	via: { from: string; to: string }
 	chunk: UnifiedChunk
 }
 
 /**
  * `data` of `POST /query` on a unified database: EXACTLY these four keys. No
- * chunk_content, graph_context, sources, additional_context, temporal_facts,
- * forceful_relations bucket or sub_tenant_id.
+ * chunk_content, graph_context, sources, additional_context, temporal_facts or
+ * sub_tenant_id. The envelope's `meta` on a unified answer carries no
+ * tenant_id, sub_tenant_id or source_type either, and nothing here reads it.
  */
 export interface UnifiedQueryResponse {
 	chunks: UnifiedChunk[]
 	/** [] when graph_context=false. */
 	graph: UnifiedGraphPath[]
 	/** [] when none, or when follow_forceful_relations=false. */
-	relations: UnifiedRelation[]
+	forceful_relations: UnifiedForcefulRelation[]
 	/**
 	 * A server-built string ready to inject into a model call, with citation
 	 * labels [1], [R1], [P1]. Clients surface it to the agent verbatim instead
@@ -161,9 +169,16 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * detect by the presence of `llm_prompt` (a string) and `graph` (an array),
  * never by a request flag, because the legacy shape (`graph_context`,
  * `chunk_content`) keeps arriving from split databases and stored logs.
+ * `forceful_relations` (an array) is required too: a body that still carries
+ * the pre-rename `relations` key is not this contract, and nothing reads it.
  */
 export function isUnifiedQueryResponse(value: unknown): value is UnifiedQueryResponse {
-	return isRecord(value) && Array.isArray(value.graph) && typeof value.llm_prompt === "string"
+	return (
+		isRecord(value) &&
+		Array.isArray(value.graph) &&
+		Array.isArray(value.forceful_relations) &&
+		typeof value.llm_prompt === "string"
+	)
 }
 
 /**

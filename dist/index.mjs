@@ -311,7 +311,7 @@ function isRecord(value) {
   return value != null && typeof value === "object" && !Array.isArray(value);
 }
 function isUnifiedQueryResponse(value) {
-  return isRecord(value) && Array.isArray(value.graph) && typeof value.llm_prompt === "string";
+  return isRecord(value) && Array.isArray(value.graph) && Array.isArray(value.forceful_relations) && typeof value.llm_prompt === "string";
 }
 function isUnifiedIngestResponse(value) {
   return isRecord(value) && typeof value.success_count === "number";
@@ -1381,9 +1381,9 @@ function unifiedRecallLines(response, opts) {
       if (summary) lines.push(`- ${summary}`);
     }
   }
-  if (response.relations.length > 0) {
-    lines.push("Related:");
-    for (const rel of response.relations) {
+  if (response.forceful_relations.length > 0) {
+    lines.push("Forceful relations:");
+    for (const rel of response.forceful_relations) {
       lines.push(`- [${rel.via.from} -> ${rel.via.to}] ${opts.preview(rel.chunk.content)}`);
     }
   }

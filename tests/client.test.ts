@@ -407,6 +407,7 @@ const UNIFIED_QUERY_FIXTURE: UnifiedQueryResponse = {
 	],
 	graph: [
 		{
+			origin: "query_path",
 			triplets: [
 				{
 					source: { entity_id: "ent_a3f", name: "John" },
@@ -423,17 +424,22 @@ const UNIFIED_QUERY_FIXTURE: UnifiedQueryResponse = {
 			path_summary: "John is on the Pro plan since June 2026.",
 		},
 	],
-	relations: [
+	forceful_relations: [
 		{
 			via: { from: "linear-PRO-1169", to: "linear-PRO-1169-comment-4" },
 			chunk: { chunk_id: "ck_r1", context_id: "linear-PRO-1169-comment-4", score: 0.5, content: "Comment 4 body" },
 		},
 	],
+	// Byte for byte what the server renders for this body.
 	llm_prompt:
 		"=== CONTEXT ===\nCite anything you use from this context with its bracketed label, e.g. [1].\n\n" +
-		"[1] context_id: chat-2026-07-29#w2\nuser: Keep answers short please\nassistant: Got it.\n\n" +
-		"=== RELATED CONTEXT ===\n[R1] context_id: linear-PRO-1169-comment-4 (via linear-PRO-1169)\nComment 4 body\n\n" +
-		"=== GRAPH ===\n[P1] John is on the Pro plan since June 2026.\n    John -> subscribed to -> Pro plan [1]",
+		"[1] context_id: chat-2026-07-29#w2\nuser: Keep answers short please\nassistant: Got it.\n" +
+		"Enrichment: User prefers short, bullet-point answers.\n\n" +
+		"=== FORCEFUL RELATIONS ===\n" +
+		"Linked to a result by the author at ingest time (forceful_relations), not by relevance to this query.\n\n" +
+		"[R1] context_id: linear-PRO-1169-comment-4, linked from: linear-PRO-1169\nComment 4 body\n\n" +
+		"=== GRAPH ===\nFacts extracted from this context. A label after a fact is the context it came from.\n\n" +
+		"[P1] John is on the Pro plan since June 2026.\n    John -> subscribed to -> Pro plan (since June) [1]",
 }
 
 const RECALL_CFG = {
@@ -471,8 +477,9 @@ test("unified recall surfaces the four-key body and the injected text is llm_pro
 	assert.equal(res.chunks[0]!.score, 0.87)
 	assert.equal(res.chunks[0]!.content, "user: Keep answers short please\nassistant: Got it.")
 	assert.equal(res.chunks[0]!.enrichment?.text, "User prefers short, bullet-point answers.")
+	assert.equal(res.graph[0]!.origin, "query_path")
 	assert.equal(res.graph[0]!.path_summary, "John is on the Pro plan since June 2026.")
-	assert.equal(res.relations[0]!.via.to, "linear-PRO-1169-comment-4")
+	assert.equal(res.forceful_relations[0]!.via.to, "linear-PRO-1169-comment-4")
 
 	// The rendered context IS llm_prompt, byte for byte.
 	assert.equal(buildRecalledContext(res), UNIFIED_QUERY_FIXTURE.llm_prompt)
@@ -485,10 +492,10 @@ test("unified recall surfaces the four-key body and the injected text is llm_pro
 	assert.ok(injected.prependContext.includes(UNIFIED_QUERY_FIXTURE.llm_prompt))
 })
 
-// The server sends a blank llm_prompt when chunks, graph and relations are all
-// empty; that is "nothing matched", so nothing is injected.
+// The server sends a blank llm_prompt when chunks, graph and forceful_relations
+// are all empty; that is "nothing matched", so nothing is injected.
 test("a blank unified llm_prompt injects nothing", async () => {
-	const { client } = unifiedRecallClient({ chunks: [], graph: [], relations: [], llm_prompt: "" })
+	const { client } = unifiedRecallClient({ chunks: [], graph: [], forceful_relations: [], llm_prompt: "" })
 	const hook = createRecallHook(client, RECALL_CFG)
 	assert.equal(await hook({ prompt: "anything at all" }), undefined)
 })
