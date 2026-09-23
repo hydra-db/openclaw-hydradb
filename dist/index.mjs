@@ -1366,13 +1366,17 @@ function recallIsEmpty(response) {
   if (isUnifiedQueryResponse(response)) return response.llm_prompt.trim() === "";
   return !response.chunks || response.chunks.length === 0;
 }
-function unifiedRecallLines(response, opts) {
+function unifiedRecallLines(response) {
   const lines = [];
-  response.chunks.slice(0, opts.maxChunks).forEach((chunk, i) => {
-    lines.push(
-      `${i + 1}. [${chunk.context_id}] ${opts.preview(chunk.content)} (${Math.round(chunk.score * 100)}%)`
-    );
-    if (chunk.enrichment) lines.push(`   ${opts.preview(chunk.enrichment)}`);
+  const detailLines = (chunk) => {
+    if (chunk.enrichment) lines.push(`   ${chunk.enrichment}`);
+    for (const fact of chunk.temporal ?? []) {
+      if (fact.content) lines.push(`   Temporal: ${fact.content}`);
+    }
+  };
+  response.chunks.forEach((chunk, i) => {
+    lines.push(`${i + 1}. [${chunk.context_id}] ${chunk.content} (${Math.round(chunk.score * 100)}%)`);
+    detailLines(chunk);
   });
   if (response.graph.length > 0) {
     lines.push("Graph:");
@@ -1384,7 +1388,8 @@ function unifiedRecallLines(response, opts) {
   if (response.forceful_relations.length > 0) {
     lines.push("Forceful relations:");
     for (const rel of response.forceful_relations) {
-      lines.push(`- [${rel.via.from} -> ${rel.via.to}] ${opts.preview(rel.chunk.content)}`);
+      lines.push(`- [${rel.via.from} -> ${rel.via.to}] ${rel.chunk.content}`);
+      detailLines(rel.chunk);
     }
   }
   return lines;
@@ -1623,7 +1628,7 @@ function registerSlashCommands(api, client, cfg, getSessionId) {
             return { text: `No memories found for "${query}"` };
           }
           if (isUnifiedQueryResponse(res)) {
-            const lines2 = unifiedRecallLines(res, { maxChunks: 10, preview: (t) => preview(t, 120) });
+            const lines2 = unifiedRecallLines(res);
             return { text: `Found ${res.chunks.length} chunks:
 
 ${lines2.join("\n")}` };
@@ -2376,11 +2381,7 @@ async function queryAction(ctx, query, opts) {
     return;
   }
   if (isUnifiedQueryResponse(res)) {
-    const lines = unifiedRecallLines(res, {
-      maxChunks: res.chunks.length,
-      preview: (t) => t.slice(0, 200)
-    });
-    for (const line of lines) console.log(line);
+    for (const line of unifiedRecallLines(res)) console.log(line);
     return;
   }
   for (const chunk of res.chunks) {

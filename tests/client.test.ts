@@ -471,6 +471,18 @@ test("unified recall surfaces the four-key body and the injected text is llm_pro
 	assert.ok(injected.prependContext.includes(UNIFIED_QUERY_FIXTURE.llm_prompt))
 })
 
+// No compaction (PRO-1618): an llm_prompt far past any plausible budget is
+// injected by the recall hook and returned by the search tool whole.
+test("a long unified llm_prompt is injected whole", async () => {
+	const llmPrompt = `# Query results\n\n${"y".repeat(50000)} END-OF-PROMPT`
+	const { client } = unifiedRecallClient({ ...UNIFIED_QUERY_FIXTURE, llm_prompt: llmPrompt })
+	const hook = createRecallHook(client, RECALL_CFG)
+	const injected = await hook({ prompt: "who owns refund processing?" })
+	assert.ok(injected && typeof injected.prependContext === "string")
+	assert.equal(injected.prependContext, envelopeForInjection(llmPrompt))
+	assert.ok(injected.prependContext.includes(llmPrompt), "the whole llm_prompt reaches the agent")
+})
+
 // The server sends a blank llm_prompt when chunks, graph and forceful_relations
 // are all empty; that is "nothing matched", so nothing is injected.
 test("a blank unified llm_prompt injects nothing", async () => {

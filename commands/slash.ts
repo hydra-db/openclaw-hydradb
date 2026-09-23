@@ -112,7 +112,8 @@ export function registerSlashCommands(
 					// PRO-1618: a unified result is read from the contract's own
 					// fields; the split rendering below is untouched.
 					if (isUnifiedQueryResponse(res)) {
-						const lines = unifiedRecallLines(res, { maxChunks: 10, preview: (t) => preview(t, 120) })
+						// Whole: no compaction of the unified query response.
+						const lines = unifiedRecallLines(res)
 						return { text: `Found ${res.chunks.length} chunks:\n\n${lines.join("\n")}` }
 					}
 

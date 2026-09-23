@@ -153,11 +153,8 @@ async function queryAction(ctx: CliCtx, query: string, opts: { limit: string }):
 	// PRO-1618: a unified result is read from the contract's own fields; the
 	// split rendering below is untouched.
 	if (isUnifiedQueryResponse(res)) {
-		const lines = unifiedRecallLines(res, {
-			maxChunks: res.chunks.length,
-			preview: (t) => t.slice(0, 200),
-		})
-		for (const line of lines) console.log(line)
+		// Printed whole: no compaction of the unified query response.
+		for (const line of unifiedRecallLines(res)) console.log(line)
 		return
 	}
 

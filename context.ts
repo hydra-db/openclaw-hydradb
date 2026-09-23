@@ -3,6 +3,7 @@ import type {
 	PathTriplet,
 	RecallResponse,
 	ScoredPath,
+	UnifiedChunk,
 	UnifiedQueryResponse,
 	VectorChunk,
 } from "./types/hydra.ts"
@@ -21,20 +22,23 @@ export function recallIsEmpty(response: RecallResponse): boolean {
 /**
  * The structured lines a user-facing surface (slash command, CLI) prints for a
  * unified result (PRO-1618), read from the contract's own fields:
- * `chunks[].context_id` / `score` / `content` / `enrichment`, then
- * `graph[].path_summary`, then `forceful_relations[]`. The split surfaces keep
- * their own line formats untouched.
+ * `chunks[].context_id` / `score` / `content` / `enrichment` / `temporal`, then
+ * `graph[].path_summary`, then `forceful_relations[]`. Nothing is compacted:
+ * every chunk the server returned is listed, and content, enrichment and
+ * temporal facts are printed whole. The split surfaces keep their own line
+ * formats untouched.
  */
-export function unifiedRecallLines(
-	response: UnifiedQueryResponse,
-	opts: { maxChunks: number; preview: (text: string) => string },
-): string[] {
+export function unifiedRecallLines(response: UnifiedQueryResponse): string[] {
 	const lines: string[] = []
-	response.chunks.slice(0, opts.maxChunks).forEach((chunk, i) => {
-		lines.push(
-			`${i + 1}. [${chunk.context_id}] ${opts.preview(chunk.content)} (${Math.round(chunk.score * 100)}%)`,
-		)
-		if (chunk.enrichment) lines.push(`   ${opts.preview(chunk.enrichment)}`)
+	const detailLines = (chunk: UnifiedChunk): void => {
+		if (chunk.enrichment) lines.push(`   ${chunk.enrichment}`)
+		for (const fact of chunk.temporal ?? []) {
+			if (fact.content) lines.push(`   Temporal: ${fact.content}`)
+		}
+	}
+	response.chunks.forEach((chunk, i) => {
+		lines.push(`${i + 1}. [${chunk.context_id}] ${chunk.content} (${Math.round(chunk.score * 100)}%)`)
+		detailLines(chunk)
 	})
 	if (response.graph.length > 0) {
 		lines.push("Graph:")
@@ -50,7 +54,8 @@ export function unifiedRecallLines(
 	if (response.forceful_relations.length > 0) {
 		lines.push("Forceful relations:")
 		for (const rel of response.forceful_relations) {
-			lines.push(`- [${rel.via.from} -> ${rel.via.to}] ${opts.preview(rel.chunk.content)}`)
+			lines.push(`- [${rel.via.from} -> ${rel.via.to}] ${rel.chunk.content}`)
+			detailLines(rel.chunk)
 		}
 	}
 	return lines
@@ -75,7 +80,8 @@ export function buildRecalledContext(
 ): string {
 	// PRO-1618: a unified database ships its own rendering. `llm_prompt` is the
 	// server-built, citation-labelled string the contract says to surface to
-	// the agent verbatim, so nothing is rebuilt from chunks[] / graph[] here.
+	// the agent verbatim, so nothing is rebuilt from chunks[] / graph[] here,
+	// and it is returned whole: never truncated, summarised or budgeted.
 	if (isUnifiedQueryResponse(response)) return response.llm_prompt
 
 	const minScore = opts?.minEvidenceScore ?? 0.4
