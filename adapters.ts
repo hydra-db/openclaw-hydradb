@@ -13,14 +13,15 @@
 
 import type { HydraDB as SDK } from "@hydradb/sdk"
 
+import type { UnifiedIngestResponse } from "./hydra/unified.ts"
 import type {
 	AddMemoryResponse,
 	DeleteMemoryResponse,
 	FetchContentResponse,
 	ListMemoriesResponse,
 	ListSourcesResponse,
-	RecallResponse,
 	ScoredPath,
+	SplitRecallResponse,
 	VectorChunk,
 } from "./types/hydra.ts"
 
@@ -51,8 +52,12 @@ function toVectorChunk(chunk: SDK.SearchV2Chunk): VectorChunk {
 	}
 }
 
-/** SDK retrieval result → the legacy `RecallResponse` fed to `buildRecalledContext`. */
-export function toRecallResponse(data: SDK.SearchV2RetrievalResult): RecallResponse {
+/**
+ * SDK retrieval result → the legacy split `RecallResponse` fed to
+ * `buildRecalledContext`. A unified database's four-key body (PRO-1618) never
+ * comes through here: it is surfaced as it came off the wire.
+ */
+export function toRecallResponse(data: SDK.SearchV2RetrievalResult): SplitRecallResponse {
 	const graph = data.graphContext
 	const additional: Record<string, VectorChunk> = {}
 	for (const [id, chunk] of Object.entries(data.additionalContext ?? {})) {
@@ -76,9 +81,9 @@ export function toRecallResponse(data: SDK.SearchV2RetrievalResult): RecallRespo
 export function toAddMemoryResponse(
 	data: SDK.IngestionV2SourceUploadResponse,
 ): AddMemoryResponse {
-	// Read both spellings: the SDK deserialises to camelCase, the raw unified
-	// ingest path (PRO-1618) is normalised to the same names but a wire-shaped
-	// payload must still count rather than read as zero.
+	// Read both spellings: the SDK deserialises to camelCase, but a wire-shaped
+	// payload (a mocked transport, an older raw path) must still count rather
+	// than read as zero.
 	const d = data as unknown as Record<string, unknown>
 	const num = (...keys: string[]): number => {
 		for (const key of keys) {
@@ -92,6 +97,30 @@ export function toAddMemoryResponse(
 		results: [],
 		success_count: num("successCount", "success_count"),
 		failed_count: num("failedCount", "failed_count"),
+	}
+}
+
+/**
+ * Unified ingest 202 (PRO-1618) → the legacy `AddMemoryResponse`, read straight
+ * off the wire. The row keeps the old spelling, as the contract says:
+ * `results[].source_id` IS the item's context_id, and `infer` is its enrich
+ * flag. Counts are snake_case on the wire.
+ */
+export function toUnifiedAddMemoryResponse(data: UnifiedIngestResponse): AddMemoryResponse {
+	const rows = Array.isArray(data.results) ? data.results : []
+	return {
+		success: data.success ?? false,
+		message: data.message ?? "",
+		results: rows.map((row) => ({
+			source_id: row.source_id ?? "",
+			title: row.title ?? null,
+			status: row.status ?? "",
+			infer: row.infer ?? false,
+			error: row.error ?? null,
+			error_code: row.error_code ?? null,
+		})),
+		success_count: typeof data.success_count === "number" ? data.success_count : 0,
+		failed_count: typeof data.failed_count === "number" ? data.failed_count : 0,
 	}
 }
 

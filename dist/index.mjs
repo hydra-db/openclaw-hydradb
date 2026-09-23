@@ -56,6 +56,23 @@ function toAddMemoryResponse(data) {
     failed_count: num("failedCount", "failed_count")
   };
 }
+function toUnifiedAddMemoryResponse(data) {
+  const rows = Array.isArray(data.results) ? data.results : [];
+  return {
+    success: data.success ?? false,
+    message: data.message ?? "",
+    results: rows.map((row) => ({
+      source_id: row.source_id ?? "",
+      title: row.title ?? null,
+      status: row.status ?? "",
+      infer: row.infer ?? false,
+      error: row.error ?? null,
+      error_code: row.error_code ?? null
+    })),
+    success_count: typeof data.success_count === "number" ? data.success_count : 0,
+    failed_count: typeof data.failed_count === "number" ? data.failed_count : 0
+  };
+}
 function str(record, ...keys) {
   for (const key of keys) {
     const value = record[key];
@@ -289,6 +306,17 @@ var RawHttp = class {
   }
 };
 
+// hydra/unified.ts
+function isRecord(value) {
+  return value != null && typeof value === "object" && !Array.isArray(value);
+}
+function isUnifiedQueryResponse(value) {
+  return isRecord(value) && Array.isArray(value.graph) && Array.isArray(value.forceful_relations) && typeof value.llm_prompt === "string";
+}
+function isUnifiedIngestResponse(value) {
+  return isRecord(value) && typeof value.success_count === "number";
+}
+
 // hydra/client.ts
 function kindToType(kind) {
   return kind;
@@ -343,8 +371,10 @@ var Resource = class {
   /**
    * A raw v2 call whose wire result is run through the SDK's OWN response
    * serializer, so the caller gets the same camelCase object the SDK path
-   * returns. Used for `kind: "unified"` (PRO-1618): the pinned SDK's REQUEST
-   * serializers reject that enum value before anything is sent.
+   * returns. Used for the unified list, relations and delete calls (PRO-1618),
+   * which send no `type`: built by hand so the wire carries exactly the
+   * contract's fields and nothing the pinned SDK's request serializers, which
+   * know only the split enum, might add or reject.
    */
   async rawTyped(what, method, path2, body, parse) {
     const wire = await this.requireRaw(what).request(method, path2, body);
@@ -369,26 +399,24 @@ var ContextResource = class extends Resource {
   /** The single retrieval entry point (SDK `client.query`). */
   query(params) {
     if (params.kind === "unified") {
-      return this.call(
-        "/query",
-        () => this.rawTyped(
-          "unified query",
+      return this.call("/query", async () => {
+        const wire = await this.requireRaw("unified query").request(
           "POST",
           "/query",
           compact({
             ...this.scope(params.collection),
             query: params.query,
-            type: "unified",
             operator: params.operator,
             max_results: params.maxResults,
             mode: params.mode,
             graph_context: params.graphContext,
+            follow_forceful_relations: params.followForcefulRelations,
             alpha: params.alpha,
             recency_bias: params.recencyBias
-          }),
-          serialization.SearchV2RetrievalResult.parseOrThrow
-        )
-      );
+          })
+        );
+        return isUnifiedQueryResponse(wire) ? wire : serialization.SearchV2RetrievalResult.parseOrThrow(wire, SDK_PARSE_OPTS);
+      });
     }
     return this.call(
       "/query",
@@ -450,25 +478,23 @@ var ContextResource = class extends Resource {
     return this.call("/context/ingest", () => this.sdk.context.ingest(request));
   }
   /**
-   * The unified ingest shape (PRO-1618): one `items[]` array, each item text or
-   * a conversation, no corpus selector, sent as the JSON body of
-   * `POST /context/ingest`. On a split database the items land in its memory
-   * corpus, so a caller that has not created a unified database sees no change.
+   * The unified ingest body (PRO-1618): the JSON body of `POST /context/ingest`
+   * with the canonical list key `context` (never `items`), one item that is
+   * either `text` or a `conversation` of {role, content, name?} turns, and
+   * the request-level `enrich` / `upsert` / `instructions` defaults. No corpus
+   * selector. The 202 is returned as it came off the wire: its
+   * `results[].source_id` is the item's context_id.
    */
   ingestUnified(params) {
     const item = {};
+    if (params.sourceId != null) item.context_id = params.sourceId;
+    if (params.title != null) item.title = params.title;
     if (params.text != null) item.text = params.text;
     if (params.pairs != null) {
       item.conversation = params.pairs.flatMap((turn) => [
         { role: "user", content: turn.user, ...params.userName ? { name: params.userName } : {} },
         { role: "assistant", content: turn.assistant }
       ]);
-    }
-    if (params.sourceId != null) item.context_id = params.sourceId;
-    if (params.title != null) item.title = params.title;
-    item.enrich = params.infer ?? true;
-    if (item.enrich && params.customInstructions != null) {
-      item.custom_instructions = params.customInstructions;
     }
     if (params.tenantMetadata != null) {
       item.attributes = parseMaybeJson(params.tenantMetadata);
@@ -480,20 +506,19 @@ var ContextResource = class extends Resource {
         item.custom_attributes = { document_metadata: params.documentMetadata };
       }
     }
+    const enrich = params.infer ?? true;
     const body = {
       ...this.scope(params.collection),
-      items: [item],
-      ...params.upsert != null ? { upsert: params.upsert } : {}
+      context: [item],
+      enrich,
+      ...params.upsert != null ? { upsert: params.upsert } : {},
+      // Same omission rule as the split item: instructions only steer
+      // enrichment, so they travel only when enrichment is on.
+      ...enrich && params.customInstructions != null ? { instructions: params.customInstructions } : {}
     };
     return this.call(
       "/context/ingest",
-      () => this.rawTyped(
-        "unified ingest",
-        "POST",
-        "/context/ingest",
-        body,
-        serialization.IngestionV2SourceUploadResponse.parseOrThrow
-      )
+      () => this.requireRaw("unified ingest").request("POST", "/context/ingest", body)
     );
   }
   /** List memories or knowledge sources (SDK `context.list`). */
@@ -507,7 +532,6 @@ var ContextResource = class extends Resource {
           "/context/list",
           compact({
             ...this.scope(params.collection),
-            type: "unified",
             ids: params.ids,
             page: params.page,
             page_size: params.pageSize
@@ -562,7 +586,6 @@ var ContextResource = class extends Resource {
             database: scope.database,
             collection: scope.collection,
             id: params.id,
-            type: "unified",
             limit: params.limit,
             cursor: params.cursor
           })}`,
@@ -591,7 +614,7 @@ var ContextResource = class extends Resource {
           "unified delete",
           "DELETE",
           "/context",
-          compact({ ...this.scope(params.collection), ids: params.ids, type: "unified" }),
+          compact({ ...this.scope(params.collection), ids: params.ids }),
           serialization.SourcesMemoryDeleteResponse.parseOrThrow
         )
       );
@@ -752,6 +775,9 @@ var log = {
 
 // client.ts
 var INGEST_INSTRUCTIONS = "Focus on extracting user preferences, habits, opinions, likes, dislikes, goals, and recurring themes. Capture any stated or implied personal context that would help personalise future interactions. Capture important personal details like name, age, email ids, phone numbers, etc. along with the original name and context so that it can be used to personalise future interactions.";
+function adaptIngest(data) {
+  return isUnifiedIngestResponse(data) ? toUnifiedAddMemoryResponse(data) : toAddMemoryResponse(data);
+}
 var HydraClient = class {
   tenantId;
   subTenantId;
@@ -819,7 +845,7 @@ var HydraClient = class {
       },
       ...opts?.attributes && { tenantMetadata: opts.attributes }
     }));
-    return toAddMemoryResponse(data);
+    return adaptIngest(data);
   }
   async ingestText(text, opts) {
     const shouldInfer = opts?.infer ?? true;
@@ -836,7 +862,7 @@ var HydraClient = class {
       ...opts?.attributes && { tenantMetadata: opts.attributes },
       upsert: true
     }));
-    return toAddMemoryResponse(data);
+    return adaptIngest(data);
   }
   // --- Recall ---
   async recall(query, opts) {
@@ -847,9 +873,10 @@ var HydraClient = class {
       mode: opts?.mode ?? "thinking",
       alpha: 0.8,
       recencyBias: opts?.recencyBias ?? 0,
-      graphContext: opts?.graphContext ?? true
+      graphContext: opts?.graphContext ?? true,
+      followForcefulRelations: opts?.followForcefulRelations ?? true
     }));
-    return toRecallResponse(data);
+    return isUnifiedQueryResponse(data) ? data : toRecallResponse(data);
   }
   // --- List ---
   async listMemories() {
@@ -1334,6 +1361,190 @@ function registerOnboardingSlashCommands(api, client, cfg) {
   });
 }
 
+// context.ts
+function recallIsEmpty(response) {
+  if (isUnifiedQueryResponse(response)) return response.llm_prompt.trim() === "";
+  return !response.chunks || response.chunks.length === 0;
+}
+function unifiedRecallLines(response) {
+  const lines = [];
+  const detailLines = (chunk) => {
+    if (chunk.enrichment) lines.push(`   ${chunk.enrichment}`);
+    for (const fact of chunk.temporal ?? []) {
+      if (fact.content) lines.push(`   Temporal: ${fact.content}`);
+    }
+  };
+  response.chunks.forEach((chunk, i) => {
+    lines.push(`${i + 1}. [${chunk.context_id}] ${chunk.content} (${Math.round(chunk.score * 100)}%)`);
+    detailLines(chunk);
+  });
+  if (response.graph.length > 0) {
+    lines.push("Graph:");
+    for (const path2 of response.graph) {
+      const summary = path2.path_summary || path2.triplets.map((t) => `${t.source.name} -> ${t.relation.predicate} -> ${t.target.name}`).join("; ");
+      if (summary) lines.push(`- ${summary}`);
+    }
+  }
+  if (response.forceful_relations.length > 0) {
+    lines.push("Forceful relations:");
+    for (const rel of response.forceful_relations) {
+      lines.push(`- [${rel.via.from} -> ${rel.via.to}] ${rel.chunk.content}`);
+      detailLines(rel.chunk);
+    }
+  }
+  return lines;
+}
+function formatTriplet(triplet) {
+  const src = triplet.source?.name ?? "?";
+  const rel = triplet.relation;
+  const predicate = rel?.raw_predicate ?? rel?.canonical_predicate ?? "related to";
+  const tgt = triplet.target?.name ?? "?";
+  const ctx = rel?.context ? ` [${rel.context}]` : "";
+  return `  (${src}) \u2014[${predicate}]\u2192 (${tgt})${ctx}`;
+}
+function buildRecalledContext(response, opts) {
+  if (isUnifiedQueryResponse(response)) return response.llm_prompt;
+  const minScore = opts?.minEvidenceScore ?? 0.4;
+  const chunks = response.chunks ?? [];
+  const graphCtx = response.graph_context ?? {
+    query_paths: [],
+    chunk_relations: [],
+    chunk_id_to_group_ids: {}
+  };
+  const extraContextMap = response.additional_context ?? {};
+  const rawRelations = graphCtx.chunk_relations ?? [];
+  const relationIndex = {};
+  for (let idx = 0; idx < rawRelations.length; idx++) {
+    const relation = rawRelations[idx];
+    if ((relation.relevancy_score ?? 0) < minScore) continue;
+    const groupId = relation.group_id ?? `p_${idx}`;
+    relationIndex[groupId] = relation;
+  }
+  const chunkToGroupIds = graphCtx.chunk_id_to_group_ids ?? {};
+  const consumedExtraIds = /* @__PURE__ */ new Set();
+  const chunkSections = [];
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i];
+    const lines = [];
+    lines.push(`Chunk ${i + 1}`);
+    const meta = chunk.document_metadata ?? {};
+    const title = chunk.source_title || meta.title;
+    if (title) {
+      lines.push(`Source: ${title}`);
+    }
+    lines.push(chunk.chunk_content ?? "");
+    const chunkUuid = chunk.chunk_uuid;
+    const linkedGroupIds = chunkToGroupIds[chunkUuid] ?? [];
+    const matchedRelations = [];
+    for (const gid of linkedGroupIds) {
+      if (relationIndex[gid]) {
+        matchedRelations.push(relationIndex[gid]);
+      }
+    }
+    if (matchedRelations.length === 0) {
+      for (const rel of Object.values(relationIndex)) {
+        const triplets = rel.triplets ?? [];
+        const hasChunk = triplets.some(
+          (t) => t.relation?.chunk_id === chunkUuid
+        );
+        if (hasChunk) {
+          matchedRelations.push(rel);
+        }
+      }
+    }
+    const relationLines = [];
+    for (const rel of matchedRelations) {
+      const triplets = rel.triplets ?? [];
+      if (triplets.length > 0) {
+        for (const triplet of triplets) {
+          relationLines.push(formatTriplet(triplet));
+        }
+      } else if (rel.combined_context) {
+        relationLines.push(`  ${rel.combined_context}`);
+      }
+    }
+    if (relationLines.length > 0) {
+      lines.push("Graph Relations:");
+      lines.push(...relationLines);
+    }
+    const extraIds = chunk.extra_context_ids ?? [];
+    if (extraIds.length > 0 && Object.keys(extraContextMap).length > 0) {
+      const extraLines = [];
+      for (const ctxId of extraIds) {
+        if (consumedExtraIds.has(ctxId)) continue;
+        const extraChunk = extraContextMap[ctxId];
+        if (extraChunk) {
+          consumedExtraIds.add(ctxId);
+          const extraContent = extraChunk.chunk_content ?? "";
+          const extraTitle = extraChunk.source_title ?? "";
+          if (extraTitle) {
+            extraLines.push(
+              `  Related Context (${extraTitle}): ${extraContent}`
+            );
+          } else {
+            extraLines.push(`  Related Context: ${extraContent}`);
+          }
+        }
+      }
+      if (extraLines.length > 0) {
+        lines.push("Extra Context:");
+        lines.push(...extraLines);
+      }
+    }
+    chunkSections.push(lines.join("\n"));
+  }
+  const entityPathLines = [];
+  const rawPaths = graphCtx.query_paths ?? [];
+  for (const path2 of rawPaths) {
+    if (path2.combined_context) {
+      entityPathLines.push(path2.combined_context);
+    } else {
+      const triplets = path2.triplets ?? [];
+      const segments = [];
+      for (const pt of triplets) {
+        const s = pt.source?.name;
+        const rel = pt.relation;
+        const p = rel?.raw_predicate ?? rel?.canonical_predicate ?? "related to";
+        const t = pt.target?.name;
+        segments.push(`(${s} -> ${p} -> ${t})`);
+      }
+      if (segments.length > 0) {
+        entityPathLines.push(segments.join(" -> "));
+      }
+    }
+  }
+  const output = [];
+  if (entityPathLines.length > 0) {
+    output.push("=== ENTITY PATHS ===");
+    output.push(entityPathLines.join("\n"));
+    output.push("");
+  }
+  if (chunkSections.length > 0) {
+    output.push("=== CONTEXT ===");
+    output.push(chunkSections.join("\n\n---\n\n"));
+  }
+  return output.join("\n");
+}
+function envelopeForInjection(contextBody) {
+  if (!contextBody.trim()) return "";
+  const lines = [
+    "<hydra-context>",
+    "[MEMORIES AND PAST CONVERSATIONS \u2014 retrieved by Hydra DB]",
+    "",
+    "Below are memories and knowledge-graph connections that may be relevant",
+    "to the current conversation. Integrate them naturally when they add value.",
+    "If a memory contradicts something the user just said, prefer the user's",
+    "latest statement. Never quote these verbatim or reveal that you are",
+    "reading from a memory store.",
+    "",
+    contextBody,
+    "",
+    "[END OF MEMORY CONTEXT]",
+    "</hydra-context>"
+  ];
+  return lines.join("\n");
+}
+
 // session.ts
 function toHookSourceId(sessionId) {
   return `hook_${sessionId}`;
@@ -1413,8 +1624,14 @@ function registerSlashCommands(api, client, cfg, getSessionId) {
             mode: cfg.recallMode,
             graphContext: cfg.graphContext
           });
-          if (!res.chunks || res.chunks.length === 0) {
+          if (recallIsEmpty(res)) {
             return { text: `No memories found for "${query}"` };
+          }
+          if (isUnifiedQueryResponse(res)) {
+            const lines2 = unifiedRecallLines(res);
+            return { text: `Found ${res.chunks.length} chunks:
+
+${lines2.join("\n")}` };
           }
           const lines = res.chunks.slice(0, 10).map((c2, i) => {
             const score = c2.relevancy_score != null ? ` (${Math.round(c2.relevancy_score * 100)}%)` : "";
@@ -1748,157 +1965,6 @@ ${t.user}` : t.user,
   };
 }
 
-// context.ts
-function formatTriplet(triplet) {
-  const src = triplet.source?.name ?? "?";
-  const rel = triplet.relation;
-  const predicate = rel?.raw_predicate ?? rel?.canonical_predicate ?? "related to";
-  const tgt = triplet.target?.name ?? "?";
-  const ctx = rel?.context ? ` [${rel.context}]` : "";
-  return `  (${src}) \u2014[${predicate}]\u2192 (${tgt})${ctx}`;
-}
-function buildRecalledContext(response, opts) {
-  const minScore = opts?.minEvidenceScore ?? 0.4;
-  const chunks = response.chunks ?? [];
-  const graphCtx = response.graph_context ?? {
-    query_paths: [],
-    chunk_relations: [],
-    chunk_id_to_group_ids: {}
-  };
-  const extraContextMap = response.additional_context ?? {};
-  const rawRelations = graphCtx.chunk_relations ?? [];
-  const relationIndex = {};
-  for (let idx = 0; idx < rawRelations.length; idx++) {
-    const relation = rawRelations[idx];
-    if ((relation.relevancy_score ?? 0) < minScore) continue;
-    const groupId = relation.group_id ?? `p_${idx}`;
-    relationIndex[groupId] = relation;
-  }
-  const chunkToGroupIds = graphCtx.chunk_id_to_group_ids ?? {};
-  const consumedExtraIds = /* @__PURE__ */ new Set();
-  const chunkSections = [];
-  for (let i = 0; i < chunks.length; i++) {
-    const chunk = chunks[i];
-    const lines = [];
-    lines.push(`Chunk ${i + 1}`);
-    const meta = chunk.document_metadata ?? {};
-    const title = chunk.source_title || meta.title;
-    if (title) {
-      lines.push(`Source: ${title}`);
-    }
-    lines.push(chunk.chunk_content ?? "");
-    const chunkUuid = chunk.chunk_uuid;
-    const linkedGroupIds = chunkToGroupIds[chunkUuid] ?? [];
-    const matchedRelations = [];
-    for (const gid of linkedGroupIds) {
-      if (relationIndex[gid]) {
-        matchedRelations.push(relationIndex[gid]);
-      }
-    }
-    if (matchedRelations.length === 0) {
-      for (const rel of Object.values(relationIndex)) {
-        const triplets = rel.triplets ?? [];
-        const hasChunk = triplets.some(
-          (t) => t.relation?.chunk_id === chunkUuid
-        );
-        if (hasChunk) {
-          matchedRelations.push(rel);
-        }
-      }
-    }
-    const relationLines = [];
-    for (const rel of matchedRelations) {
-      const triplets = rel.triplets ?? [];
-      if (triplets.length > 0) {
-        for (const triplet of triplets) {
-          relationLines.push(formatTriplet(triplet));
-        }
-      } else if (rel.combined_context) {
-        relationLines.push(`  ${rel.combined_context}`);
-      }
-    }
-    if (relationLines.length > 0) {
-      lines.push("Graph Relations:");
-      lines.push(...relationLines);
-    }
-    const extraIds = chunk.extra_context_ids ?? [];
-    if (extraIds.length > 0 && Object.keys(extraContextMap).length > 0) {
-      const extraLines = [];
-      for (const ctxId of extraIds) {
-        if (consumedExtraIds.has(ctxId)) continue;
-        const extraChunk = extraContextMap[ctxId];
-        if (extraChunk) {
-          consumedExtraIds.add(ctxId);
-          const extraContent = extraChunk.chunk_content ?? "";
-          const extraTitle = extraChunk.source_title ?? "";
-          if (extraTitle) {
-            extraLines.push(
-              `  Related Context (${extraTitle}): ${extraContent}`
-            );
-          } else {
-            extraLines.push(`  Related Context: ${extraContent}`);
-          }
-        }
-      }
-      if (extraLines.length > 0) {
-        lines.push("Extra Context:");
-        lines.push(...extraLines);
-      }
-    }
-    chunkSections.push(lines.join("\n"));
-  }
-  const entityPathLines = [];
-  const rawPaths = graphCtx.query_paths ?? [];
-  for (const path2 of rawPaths) {
-    if (path2.combined_context) {
-      entityPathLines.push(path2.combined_context);
-    } else {
-      const triplets = path2.triplets ?? [];
-      const segments = [];
-      for (const pt of triplets) {
-        const s = pt.source?.name;
-        const rel = pt.relation;
-        const p = rel?.raw_predicate ?? rel?.canonical_predicate ?? "related to";
-        const t = pt.target?.name;
-        segments.push(`(${s} -> ${p} -> ${t})`);
-      }
-      if (segments.length > 0) {
-        entityPathLines.push(segments.join(" -> "));
-      }
-    }
-  }
-  const output = [];
-  if (entityPathLines.length > 0) {
-    output.push("=== ENTITY PATHS ===");
-    output.push(entityPathLines.join("\n"));
-    output.push("");
-  }
-  if (chunkSections.length > 0) {
-    output.push("=== CONTEXT ===");
-    output.push(chunkSections.join("\n\n---\n\n"));
-  }
-  return output.join("\n");
-}
-function envelopeForInjection(contextBody) {
-  if (!contextBody.trim()) return "";
-  const lines = [
-    "<hydra-context>",
-    "[MEMORIES AND PAST CONVERSATIONS \u2014 retrieved by Hydra DB]",
-    "",
-    "Below are memories and knowledge-graph connections that may be relevant",
-    "to the current conversation. Integrate them naturally when they add value.",
-    "If a memory contradicts something the user just said, prefer the user's",
-    "latest statement. Never quote these verbatim or reveal that you are",
-    "reading from a memory store.",
-    "",
-    contextBody,
-    "",
-    "[END OF MEMORY CONTEXT]",
-    "</hydra-context>"
-  ];
-  return lines.join("\n");
-}
-
 // hooks/recall.ts
 function createRecallHook(client, cfg) {
   return async (event) => {
@@ -1915,7 +1981,7 @@ function createRecallHook(client, cfg) {
         mode: cfg.recallMode,
         graphContext: cfg.graphContext
       });
-      if (!response.chunks || response.chunks.length === 0) {
+      if (recallIsEmpty(response)) {
         log.debug("no memories matched");
         return;
       }
@@ -2106,7 +2172,7 @@ function registerSearchTool(api, client, cfg) {
           mode: cfg.recallMode,
           graphContext: cfg.graphContext
         });
-        if (!res.chunks || res.chunks.length === 0) {
+        if (recallIsEmpty(res)) {
           return {
             content: [{ type: "text", text: "No relevant memories found." }]
           };
@@ -2125,7 +2191,7 @@ ${contextStr}`
           ],
           details: {
             count: res.chunks.length,
-            hasGraphContext: !!res.graph_context
+            hasGraphContext: isUnifiedQueryResponse(res) ? res.graph.length > 0 : !!res.graph_context
           }
         };
       }
@@ -2310,8 +2376,12 @@ async function queryAction(ctx, query, opts) {
     mode: ctx.cfg.recallMode,
     graphContext: ctx.cfg.graphContext
   });
-  if (!res.chunks || res.chunks.length === 0) {
+  if (recallIsEmpty(res)) {
     console.log("No memories found.");
+    return;
+  }
+  if (isUnifiedQueryResponse(res)) {
+    for (const line of unifiedRecallLines(res)) console.log(line);
     return;
   }
   for (const chunk of res.chunks) {

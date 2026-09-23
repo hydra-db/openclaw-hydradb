@@ -1,4 +1,5 @@
 import assert from "node:assert/strict"
+import { readFileSync } from "node:fs"
 import { test } from "node:test"
 
 import { HydraDBClient, HydraDBError } from "@hydradb/sdk"
@@ -6,7 +7,9 @@ import { HydraDBClient, HydraDBError } from "@hydradb/sdk"
 import {
 	HydraDB,
 	HydraWrapperError,
+	isUnifiedIngestResponse,
 	isUnifiedLayoutRefusal,
+	isUnifiedQueryResponse,
 	translateError,
 	unwrap,
 } from "../hydra/index.ts"
@@ -92,8 +95,22 @@ function fetchStub(body: unknown, status = 200): { fetch: typeof fetch; calls: {
 	return { fetch: impl, calls }
 }
 
-test("unified ingest posts items[] as a JSON body", async () => {
-	const { fetch, calls } = fetchStub({ success: true, data: { success: true, success_count: 1, failed_count: 0 } })
+// PRO-1618: the unified ingest body, exactly as the contract spells it. The
+// list key is `context` (never `items`), the item is text or a conversation of
+// {role, content, name?} turns, and enrich / upsert / instructions travel at
+// request level. The 202 comes back as it came off the wire, so its
+// `results[].source_id` (the context_id) is readable by the host adapter.
+test("unified ingest posts the contract body under `context` and returns the 202 verbatim", async () => {
+	const { fetch, calls } = fetchStub({
+		success: true,
+		data: {
+			success: true,
+			message: "queued",
+			results: [{ source_id: "chat-1", title: null, status: "queued", infer: true, error: null, error_code: null }],
+			success_count: 1,
+			failed_count: 0,
+		},
+	})
 	const sdk = { context: { ingest() { throw new Error("SDK path must not be used") } } } as unknown as HydraDBClient
 	const hydra = new HydraDB({ token: "t", database: "db_u", collection: "c1", baseUrl: "https://api.test", fetch }, sdk)
 	const result = await hydra.context.ingest({
@@ -104,32 +121,60 @@ test("unified ingest posts items[] as a JSON body", async () => {
 		infer: true,
 		customInstructions: "focus",
 		documentMetadata: JSON.stringify({ source: "openclaw_hook" }),
+		tenantMetadata: { topic: "ui" },
 		upsert: true,
 	})
-	// The counts survive the raw path in the SDK's camelCase, so the host
-	// adapter reports them instead of zeros (Greptile on #26).
-	assert.equal(result.successCount, 1)
-	assert.equal(result.failedCount, 0)
+	assert.ok(isUnifiedIngestResponse(result))
+	assert.equal(result.results[0]!.source_id, "chat-1")
+	assert.equal(result.success_count, 1)
+	assert.equal(result.failed_count, 0)
 	assert.equal(calls.length, 1)
 	assert.equal(calls[0]!.url, "https://api.test/context/ingest")
 	assert.equal((calls[0]!.init.headers as Record<string, string>)["API-Version"], "2")
 	assert.deepEqual(JSON.parse(String(calls[0]!.init.body)), {
 		database: "db_u",
 		collection: "c1",
-		upsert: true,
-		items: [
+		context: [
 			{
+				context_id: "chat-1",
 				conversation: [
 					{ role: "user", content: "I prefer dark mode", name: "Ada" },
 					{ role: "assistant", content: "Noted" },
 				],
-				context_id: "chat-1",
-				enrich: true,
-				custom_instructions: "focus",
+				attributes: { topic: "ui" },
 				custom_attributes: { source: "openclaw_hook" },
 			},
 		],
+		enrich: true,
+		upsert: true,
+		instructions: "focus",
 	})
+})
+
+// Contract client rule 2: none of the split-era or alias names may reach a
+// unified database. Instructions follow the split omission rule and travel
+// only when enrichment is on.
+test("unified ingest never sends split-era or alias field names", async () => {
+	const { fetch, calls } = fetchStub({
+		success: true,
+		data: { success: true, message: "", results: [], success_count: 1, failed_count: 0 },
+	})
+	const hydra = new HydraDB({ token: "t", database: "db_u", baseUrl: "https://api.test", fetch }, {} as HydraDBClient)
+	await hydra.context.ingest({
+		kind: "unified",
+		text: "note",
+		infer: false,
+		customInstructions: "not sent when enrich is off",
+	})
+	const body = JSON.parse(String(calls[0]!.init.body)) as { context: Record<string, unknown>[] } & Record<string, unknown>
+	assert.deepEqual(body, { database: "db_u", context: [{ text: "note" }], enrich: false })
+	const forbidden = [
+		"type", "items", "contexts", "memories", "documents", "app_knowledge",
+		"infer", "source_id", "custom_instructions", "metadata", "additional_metadata",
+		"observation_date", "relations", "is_markdown", "user_name", "user_assistant_pairs",
+	]
+	const seen = new Set([...Object.keys(body), ...Object.keys(body.context[0]!)])
+	for (const key of forbidden) assert.ok(!seen.has(key), `${key} must not be sent on a unified database`)
 })
 
 test("create with a layout posts type; layout() reads details and falls back to split", async () => {
@@ -163,13 +208,65 @@ test("a raw failure keeps the status and body on the error", async () => {
 	)
 })
 
-// The pinned SDK's REQUEST serializers reject `type: "unified"` before anything
-// is sent, so unified reads and deletes are built by hand and their results
-// parsed with the SDK's own response serializer (same camelCase either way).
-test("unified query, list and delete bypass the SDK request serializers and return SDK-shaped results", async () => {
+// PRO-1618: a unified query sends NO `type` (absent is the unified default;
+// memory and knowledge are 400 there), carries follow_forceful_relations, and
+// gets the contract's four-key body back exactly as it came off the wire. The
+// envelope's unified `meta` has no tenant_id, sub_tenant_id or source_type, and
+// the result needs none of them.
+test("unified query sends no type, carries follow_forceful_relations and returns the four-key body verbatim", async () => {
+	// A real unified envelope, exactly as the server renders it: `enrichment`
+	// is a string, `enrichment_kind` its sibling, `llm_prompt` markdown.
+	const envelope = JSON.parse(
+		readFileSync(new URL("./fixtures/unified-query-response.json", import.meta.url), "utf8"),
+	) as { data: Record<string, unknown> }
+	const unifiedBody = envelope.data
+	const { fetch, calls } = fetchStub(envelope)
+	const sdk = { query() { throw new Error("SDK query must not be used for unified") } } as unknown as HydraDBClient
+	const hydra = new HydraDB({ token: "t", database: "db_u", collection: "c1", baseUrl: "https://api.test", fetch }, sdk)
+
+	const q = await hydra.context.query({
+		query: "acme",
+		kind: "unified",
+		maxResults: 5,
+		mode: "thinking",
+		alpha: 0.8,
+		graphContext: true,
+		followForcefulRelations: true,
+	})
+	assert.ok(isUnifiedQueryResponse(q))
+	assert.deepEqual(q, unifiedBody)
+	assert.deepEqual(JSON.parse(String(calls[0]!.init.body)), {
+		database: "db_u",
+		collection: "c1",
+		query: "acme",
+		max_results: 5,
+		mode: "thinking",
+		graph_context: true,
+		follow_forceful_relations: true,
+		alpha: 0.8,
+	})
+})
+
+// Contract client rule 4: the shape decides. A server that still answers a
+// unified query with the legacy shape is run through the SDK's deserialiser,
+// exactly as the split path is, instead of being mistaken for the new body.
+test("a legacy-shaped answer to a unified query still parses through the SDK path", async () => {
+	const { fetch } = fetchStub({
+		success: true,
+		data: { chunks: [{ chunk_uuid: "c1", id: "s1", chunk_content: "body", relevancy_score: 0.9 }], graph_context: null },
+	})
+	const hydra = new HydraDB({ token: "t", database: "db_u", baseUrl: "https://api.test", fetch }, {} as HydraDBClient)
+	const q = await hydra.context.query({ query: "acme", kind: "unified" })
+	assert.ok(!isUnifiedQueryResponse(q))
+	assert.equal(q.chunks?.[0]?.chunkContent, "body")
+})
+
+// Unified list, relations and delete keep their SDK-shaped results and simply
+// send no `type` anywhere: not in a JSON body, not in a query string.
+test("unified list, relations and delete send no type and keep SDK-shaped results", async () => {
 	const answers: Record<string, unknown> = {
-		"/query": { chunks: [{ chunk_uuid: "c1", id: "s1", chunk_content: "body", relevancy_score: 0.9 }], sources: [] },
 		"/context/list": { sources: [{ id: "s1", title: "T" }], total: 1 },
+		"/context/relations": { relations: [], total: 0 },
 		"/context": { success: true, deleted_count: 1, user_memory_deleted: 1, results: [] },
 	}
 	const calls: { url: string; init: RequestInit }[] = []
@@ -181,28 +278,29 @@ test("unified query, list and delete bypass the SDK request serializers and retu
 		)
 	}) as typeof fetch
 	const sdk = {
-		query() { throw new Error("SDK query must not be used for unified") },
 		context: {
 			list() { throw new Error("SDK list must not be used for unified") },
+			relations() { throw new Error("SDK relations must not be used for unified") },
 			delete() { throw new Error("SDK delete must not be used for unified") },
 		},
 	} as unknown as HydraDBClient
 	const hydra = new HydraDB({ token: "t", database: "db_u", collection: "c1", baseUrl: "https://api.test", fetch: fetchImpl }, sdk)
 
-	const q = await hydra.context.query({ query: "acme", kind: "unified", maxResults: 5, mode: "thinking", alpha: 0.8 })
-	assert.equal(q.chunks?.[0]?.chunkContent, "body")
-	assert.deepEqual(JSON.parse(String(calls[0]!.init.body)), {
-		database: "db_u", collection: "c1", query: "acme", type: "unified", max_results: 5, mode: "thinking", alpha: 0.8,
-	})
-
-	const l = await hydra.context.list({ kind: "unified" })
+	const l = await hydra.context.list({ kind: "unified", ids: ["s1"] })
 	assert.equal((l as unknown as { sources: { id: string }[] }).sources[0]?.id, "s1")
-	assert.deepEqual(JSON.parse(String(calls[1]!.init.body)), { database: "db_u", collection: "c1", type: "unified" })
+	assert.deepEqual(JSON.parse(String(calls[0]!.init.body)), { database: "db_u", collection: "c1", ids: ["s1"] })
+
+	await hydra.context.relations({ kind: "unified", id: "s1", limit: 5 })
+	const relationsUrl = new URL(calls[1]!.url)
+	assert.equal(relationsUrl.pathname, "/context/relations")
+	assert.equal(relationsUrl.searchParams.get("type"), null, "no type on a unified relations call")
+	assert.equal(relationsUrl.searchParams.get("id"), "s1")
+	assert.equal(relationsUrl.searchParams.get("limit"), "5")
 
 	const d = await hydra.context.delete({ ids: ["a"], kind: "unified" })
 	assert.equal(d.deletedCount, 1)
 	assert.equal(calls[2]!.init.method, "DELETE")
-	assert.deepEqual(JSON.parse(String(calls[2]!.init.body)), { database: "db_u", collection: "c1", ids: ["a"], type: "unified" })
+	assert.deepEqual(JSON.parse(String(calls[2]!.init.body)), { database: "db_u", collection: "c1", ids: ["a"] })
 })
 
 // PRO-1618 / hook budget: a write that failed WITHOUT a status (an AbortError

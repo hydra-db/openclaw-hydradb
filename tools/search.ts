@@ -2,7 +2,8 @@ import { Type } from "@sinclair/typebox"
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk"
 import type { HydraClient } from "../client.ts"
 import type { HydraPluginConfig } from "../config.ts"
-import { buildRecalledContext } from "../context.ts"
+import { buildRecalledContext, recallIsEmpty } from "../context.ts"
+import { isUnifiedQueryResponse } from "../hydra/index.ts"
 import { log } from "../log.ts"
 import { TOOL_NAMES } from "../tool-names.ts"
 import { registerToolWithAlias } from "./register.ts"
@@ -38,12 +39,14 @@ export function registerSearchTool(
 					graphContext: cfg.graphContext,
 				})
 
-				if (!res.chunks || res.chunks.length === 0) {
+				if (recallIsEmpty(res)) {
 					return {
 						content: [{ type: "text" as const, text: "No relevant memories found." }],
 					}
 				}
 
+				// On a unified database this is the server's `llm_prompt`, verbatim
+				// (PRO-1618); on a split one it is the legacy rendering, unchanged.
 				const contextStr = buildRecalledContext(res)
 
 				return {
@@ -55,7 +58,7 @@ export function registerSearchTool(
 					],
 					details: {
 						count: res.chunks.length,
-						hasGraphContext: !!res.graph_context,
+						hasGraphContext: isUnifiedQueryResponse(res) ? res.graph.length > 0 : !!res.graph_context,
 					},
 				}
 			},

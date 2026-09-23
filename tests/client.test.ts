@@ -1,8 +1,13 @@
+import { readFileSync } from "node:fs"
 import { test } from "node:test"
 import assert from "node:assert/strict"
 
 import { HydraClient } from "../client.ts"
-import { HydraDB, HydraWrapperError } from "../hydra/index.ts"
+import type { HydraPluginConfig } from "../config.ts"
+import { buildRecalledContext, envelopeForInjection } from "../context.ts"
+import { createRecallHook } from "../hooks/recall.ts"
+import { HydraDB, HydraWrapperError, isUnifiedQueryResponse } from "../hydra/index.ts"
+import type { UnifiedQueryResponse } from "../hydra/index.ts"
 import type { HydraDBClient } from "@hydradb/sdk"
 
 // The OpenClaw analog of the MCP client payload test (hydradb-mcp PR #36). The
@@ -385,6 +390,144 @@ test("the code alone can trigger the retry when the wording is unfamiliar", asyn
 	const client = new HydraClient("k", "tenant-a", "sub-a", undefined, hydra)
 	await client.recall("q")
 	assert.deepEqual(kinds, ["memory", "unified"])
+})
+
+// PRO-1618: the unified query fixture is a real `/query` envelope the server
+// rendered (tests/fixtures/unified-query-response.json), so the chunk shape
+// (`enrichment` a string, `enrichment_kind` beside it) and the markdown
+// `llm_prompt` are exactly what comes off the wire. Through `recall` the body
+// is surfaced as it came, and the text injected for the agent is `llm_prompt`
+// verbatim: nothing is re-rendered from chunks[] or graph[].
+const UNIFIED_QUERY_ENVELOPE = JSON.parse(
+	readFileSync(new URL("./fixtures/unified-query-response.json", import.meta.url), "utf8"),
+) as { success: boolean; data: UnifiedQueryResponse; meta: Record<string, unknown> }
+const UNIFIED_QUERY_FIXTURE: UnifiedQueryResponse = UNIFIED_QUERY_ENVELOPE.data
+
+const RECALL_CFG = {
+	maxRecallResults: 10,
+	recallMode: "thinking",
+	graphContext: true,
+	ignoreTerm: "hydra-ignore",
+} as HydraPluginConfig
+
+function unifiedRecallClient(body: unknown): { client: HydraClient; calls: Recorded[] } {
+	const calls: Recorded[] = []
+	const hydra = {
+		context: {
+			query: (args: Record<string, unknown>) => {
+				calls.push({ method: "query", args })
+				return Promise.resolve(body)
+			},
+		},
+		databases: { layout: () => Promise.resolve("unified") },
+	} as unknown as HydraDB
+	return { client: new HydraClient("k", "tenant-a", "sub-a", undefined, hydra), calls }
+}
+
+test("unified recall surfaces the four-key body and the injected text is llm_prompt verbatim", async () => {
+	const { client, calls } = unifiedRecallClient(UNIFIED_QUERY_FIXTURE)
+	const res = await client.recall("who owns refund processing?")
+
+	assert.equal(calls[0]!.args.kind, "unified")
+	assert.equal(calls[0]!.args.followForcefulRelations, true, "follow_forceful_relations is sent on a unified query")
+	assert.ok(isUnifiedQueryResponse(res))
+	assert.deepEqual(res, UNIFIED_QUERY_FIXTURE)
+
+	// The structured fields are the contract's own names. `enrichment` is a
+	// plain string and `enrichment_kind` sits beside it.
+	assert.equal(res.chunks[0]!.context_id, "refund-policy")
+	assert.equal(res.chunks[0]!.score, 0.91)
+	assert.equal(res.chunks[0]!.content, "Refunds are processed within 30 days of purchase by the Finance Department.")
+	assert.equal(res.chunks[0]!.enrichment, "Refund window is 30 days; Finance owns refund processing.")
+	assert.equal(res.chunks[0]!.enrichment_kind, "business_knowledge")
+	assert.equal(res.chunks[1]!.enrichment, "User prefers short answers about refunds.")
+	assert.equal(res.chunks[1]!.enrichment_kind, "user_preference")
+	assert.equal(res.graph[0]!.origin, "query_path")
+	assert.equal(res.graph[0]!.path_summary, "Refund processing is managed by the Finance Department.")
+	assert.equal(res.graph[1]!.origin, "chunk_relation")
+	assert.equal(res.forceful_relations[0]!.via.from, "refund-policy")
+	assert.equal(res.forceful_relations[0]!.via.to, "refund-faq")
+	// A forceful relation's chunk has the same shape; this one has no enrichment.
+	assert.equal(res.forceful_relations[0]!.chunk.context_id, "refund-faq")
+	assert.equal(res.forceful_relations[0]!.chunk.enrichment, undefined)
+	assert.equal(res.forceful_relations[0]!.chunk.enrichment_kind, undefined)
+
+	// llm_prompt is markdown; the old `=== ... ===` layout is gone.
+	assert.ok(res.llm_prompt.startsWith("# Query results\n"))
+	assert.match(res.llm_prompt, /^## Results$/m)
+	assert.match(res.llm_prompt, /^## Forceful relations$/m)
+	assert.match(res.llm_prompt, /^\*\*Enrichment:\*\* Refund window is 30 days; Finance owns refund processing\.$/m)
+	assert.match(res.llm_prompt, /\*\*Category:\*\* business_knowledge/)
+	assert.doesNotMatch(res.llm_prompt, /===/)
+
+	// The rendered context IS llm_prompt, byte for byte.
+	assert.equal(buildRecalledContext(res), UNIFIED_QUERY_FIXTURE.llm_prompt)
+
+	// And the recall hook wraps exactly that string in the injection envelope.
+	const hook = createRecallHook(client, RECALL_CFG)
+	const injected = await hook({ prompt: "who owns refund processing?" })
+	assert.ok(injected && typeof injected.prependContext === "string")
+	assert.equal(injected.prependContext, envelopeForInjection(UNIFIED_QUERY_FIXTURE.llm_prompt))
+	assert.ok(injected.prependContext.includes(UNIFIED_QUERY_FIXTURE.llm_prompt))
+})
+
+// No compaction (PRO-1618): an llm_prompt far past any plausible budget is
+// injected by the recall hook and returned by the search tool whole.
+test("a long unified llm_prompt is injected whole", async () => {
+	const llmPrompt = `# Query results\n\n${"y".repeat(50000)} END-OF-PROMPT`
+	const { client } = unifiedRecallClient({ ...UNIFIED_QUERY_FIXTURE, llm_prompt: llmPrompt })
+	const hook = createRecallHook(client, RECALL_CFG)
+	const injected = await hook({ prompt: "who owns refund processing?" })
+	assert.ok(injected && typeof injected.prependContext === "string")
+	assert.equal(injected.prependContext, envelopeForInjection(llmPrompt))
+	assert.ok(injected.prependContext.includes(llmPrompt), "the whole llm_prompt reaches the agent")
+})
+
+// The server sends a blank llm_prompt when chunks, graph and forceful_relations
+// are all empty; that is "nothing matched", so nothing is injected.
+test("a blank unified llm_prompt injects nothing", async () => {
+	const { client } = unifiedRecallClient({ chunks: [], graph: [], forceful_relations: [], llm_prompt: "" })
+	const hook = createRecallHook(client, RECALL_CFG)
+	assert.equal(await hook({ prompt: "anything at all" }), undefined)
+})
+
+// The split fixture is unchanged: the legacy shape still goes through the split
+// adapter and the legacy renderer, byte for byte.
+test("split recall still adapts the SDK shape and renders the legacy context", async () => {
+	const { client, calls } = mockClient({
+		query: { chunks: [{ chunkUuid: "c1", id: "s1", chunkContent: "Chunk body", sourceTitle: "Doc A", relevancyScore: 0.9 }] },
+	})
+	const res = await client.recall("q")
+	assert.equal(calls[0]!.args.kind, "memory")
+	assert.ok(!isUnifiedQueryResponse(res))
+	assert.equal(res.chunks[0]!.chunk_content, "Chunk body")
+	assert.equal(res.chunks[0]!.source_title, "Doc A")
+	assert.equal(buildRecalledContext(res), "=== CONTEXT ===\nChunk 1\nSource: Doc A\nChunk body")
+})
+
+// The unified 202 is parsed from the wire: `results[].source_id` is the
+// item's context_id (the row keeps the old spelling, as the contract says).
+test("unified ingest parses the 202: results[].source_id is the context id", async () => {
+	const wire = {
+		success: true,
+		message: "queued",
+		results: [{ source_id: "hook_sess1", title: null, status: "queued", infer: true, error: null, error_code: null }],
+		success_count: 1,
+		failed_count: 0,
+	}
+	const hydra = {
+		context: { ingest: () => Promise.resolve(wire) },
+		databases: { layout: () => Promise.resolve("unified") },
+	} as unknown as HydraDB
+	const client = new HydraClient("k", "tenant-a", "sub-a", undefined, hydra)
+	const res = await client.ingestConversation([{ user: "hi there", assistant: "hello!" }], "hook_sess1")
+	assert.deepEqual(res, {
+		success: true,
+		message: "queued",
+		results: [{ source_id: "hook_sess1", title: null, status: "queued", infer: true, error: null, error_code: null }],
+		success_count: 1,
+		failed_count: 0,
+	})
 })
 
 // The `all`-on-ingest advice is layout-aware and now says "This database is

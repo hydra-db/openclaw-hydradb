@@ -5,9 +5,16 @@ import {
 	toListMemoriesResponse,
 	toListSourcesResponse,
 	toRecallResponse,
+	toUnifiedAddMemoryResponse,
 } from "./adapters.ts"
-import { HydraDB, HydraWrapperError, isUnifiedLayoutRefusal } from "./hydra/index.ts"
-import type { ContextKind, Layout } from "./hydra/index.ts"
+import {
+	HydraDB,
+	HydraWrapperError,
+	isUnifiedIngestResponse,
+	isUnifiedLayoutRefusal,
+	isUnifiedQueryResponse,
+} from "./hydra/index.ts"
+import type { ContextKind, IngestResult, Layout } from "./hydra/index.ts"
 import { log } from "./log.ts"
 import type {
 	AddMemoryResponse,
@@ -41,6 +48,16 @@ const INGEST_INSTRUCTIONS =
 
 /** How the plugin decides which corpus kind to send (PRO-1618). */
 export type LayoutSetting = Layout | "auto"
+
+/**
+ * A split database answers an ingest through the SDK (camelCase); a unified
+ * one answers with the contract's 202 as it came off the wire (PRO-1618),
+ * whose `results[].source_id` is the item's context_id. Told apart by shape,
+ * so the layout retry in `withKind` needs no second bookkeeping.
+ */
+function adaptIngest(data: IngestResult): AddMemoryResponse {
+	return isUnifiedIngestResponse(data) ? toUnifiedAddMemoryResponse(data) : toAddMemoryResponse(data)
+}
 
 export class HydraClient {
 	private tenantId: string
@@ -148,7 +165,7 @@ export class HydraClient {
 			}),
 			...(opts?.attributes && { tenantMetadata: opts.attributes }),
 		}))
-		return toAddMemoryResponse(data)
+		return adaptIngest(data)
 	}
 
 	async ingestText(
@@ -178,7 +195,7 @@ export class HydraClient {
 			...(opts?.attributes && { tenantMetadata: opts.attributes }),
 			upsert: true,
 		}))
-		return toAddMemoryResponse(data)
+		return adaptIngest(data)
 	}
 
 	// --- Recall ---
@@ -190,6 +207,13 @@ export class HydraClient {
 			mode?: "fast" | "thinking"
 			graphContext?: boolean
 			recencyBias?: number
+			/**
+			 * Unified database only (PRO-1618): follow the relations declared at
+			 * ingest, filling `forceful_relations[]` and the `## Forceful
+			 * relations` section of `llm_prompt`. Default true. Never sent on a split
+			 * database.
+			 */
+			followForcefulRelations?: boolean
 		},
 	): Promise<RecallResponse> {
 		const data = await this.withKind((kind) => this.hydra.context.query({
@@ -200,8 +224,12 @@ export class HydraClient {
 			alpha: 0.8,
 			recencyBias: opts?.recencyBias ?? 0,
 			graphContext: opts?.graphContext ?? true,
+			followForcefulRelations: opts?.followForcefulRelations ?? true,
 		}))
-		return toRecallResponse(data)
+		// Contract client rule 4: the shape decides, never the request. A
+		// unified database's four-key body is surfaced as it came; anything
+		// else is the legacy shape and goes through the split adapter as before.
+		return isUnifiedQueryResponse(data) ? data : toRecallResponse(data)
 	}
 
 	// --- List ---

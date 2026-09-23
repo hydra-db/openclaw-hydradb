@@ -1,7 +1,8 @@
 /**
  * A minimal JSON transport for the v2 calls the pinned SDK cannot make yet
- * (PRO-1618): `items` on `POST /context/ingest`, `type` on `POST /databases`,
- * and the `GET /databases` layout probe. The generated client appends only the
+ * (PRO-1618): the unified `context[]` body on `POST /context/ingest`, the
+ * type-less unified `/query`, `type` on `POST /databases`, and the
+ * `GET /databases` layout probe. The generated client appends only the
  * multipart fields it knows and strips unknown JSON keys, so until the SDK is
  * regenerated these go over the wire by hand, through the same envelope unwrap
  * and error translation as everything else. Ported from the MCP wrapper.

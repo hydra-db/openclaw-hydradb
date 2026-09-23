@@ -1,6 +1,8 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk"
 import type { HydraClient } from "../client.ts"
 import type { HydraPluginConfig } from "../config.ts"
+import { recallIsEmpty, unifiedRecallLines } from "../context.ts"
+import { isUnifiedQueryResponse } from "../hydra/index.ts"
 import { log } from "../log.ts"
 import { toToolSourceId } from "../session.ts"
 import { SLASH_NAMES, warnDeprecated } from "../tool-names.ts"
@@ -103,8 +105,16 @@ export function registerSlashCommands(
 						graphContext: cfg.graphContext,
 					})
 
-					if (!res.chunks || res.chunks.length === 0) {
+					if (recallIsEmpty(res)) {
 						return { text: `No memories found for "${query}"` }
+					}
+
+					// PRO-1618: a unified result is read from the contract's own
+					// fields; the split rendering below is untouched.
+					if (isUnifiedQueryResponse(res)) {
+						// Whole: no compaction of the unified query response.
+						const lines = unifiedRecallLines(res)
+						return { text: `Found ${res.chunks.length} chunks:\n\n${lines.join("\n")}` }
 					}
 
 					const lines = res.chunks.slice(0, 10).map((c, i) => {
