@@ -336,11 +336,15 @@ export function fitUnifiedPrompt(response: UnifiedQueryResponse, maxChars: numbe
 	// so later results can lose their headings and labels here. The note says
 	// how much was cut. A bound shorter than the note is a plain prefix.
 	if (text.length > maxChars) {
-		const note = `\n[recall cut to fit the context budget: ${text.length - maxChars} more characters not shown]`
-		if (maxChars <= note.length) return text.slice(0, maxChars)
-		const head = text.slice(0, maxChars - note.length)
+		// The note is sized with the largest count it could show, so the text
+		// kept is fixed before the count is: it then reports exactly what was cut.
+		const noteFor = (n: number) => `\n[recall cut to fit the context budget: ${n} more characters not shown]`
+		const room = noteFor(text.length).length
+		if (maxChars <= room) return text.slice(0, maxChars)
+		const head = text.slice(0, maxChars - room)
 		const lastLine = head.lastIndexOf("\n")
-		text = (lastLine > head.length * 0.8 ? head.slice(0, lastLine) : head) + note
+		const kept = lastLine > head.length * 0.8 ? head.slice(0, lastLine) : head
+		text = kept + noteFor(text.length - kept.length)
 	}
 	return text
 }

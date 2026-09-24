@@ -1531,12 +1531,14 @@ function fitUnifiedPrompt(response, maxChars) {
     text = lines.join("\n");
   }
   if (text.length > maxChars) {
-    const note = `
-[recall cut to fit the context budget: ${text.length - maxChars} more characters not shown]`;
-    if (maxChars <= note.length) return text.slice(0, maxChars);
-    const head = text.slice(0, maxChars - note.length);
+    const noteFor = (n) => `
+[recall cut to fit the context budget: ${n} more characters not shown]`;
+    const room = noteFor(text.length).length;
+    if (maxChars <= room) return text.slice(0, maxChars);
+    const head = text.slice(0, maxChars - room);
     const lastLine = head.lastIndexOf("\n");
-    text = (lastLine > head.length * 0.8 ? head.slice(0, lastLine) : head) + note;
+    const kept = lastLine > head.length * 0.8 ? head.slice(0, lastLine) : head;
+    text = kept + noteFor(text.length - kept.length);
   }
   return text;
 }

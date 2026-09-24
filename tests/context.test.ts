@@ -285,7 +285,13 @@ test("fitUnifiedPrompt: the bound holds even when the structure alone is over it
 	const huge = bigUnified(200, 50)
 	const out = fitUnifiedPrompt(huge, 2_000)
 	assert.ok(out.length <= 2_000, `bounded (${out.length})`)
-	assert.match(out, /\[recall cut to fit the context budget: \d+ more characters not shown\]$/)
+	const m = /\n\[recall cut to fit the context budget: (\d+) more characters not shown\]$/.exec(out)
+	assert.ok(m, "the note ends the text")
+	// Bodies of 50 characters and short lines: nothing is shortened before the
+	// cut, so the count must be exactly the prompt characters not kept.
+	const kept = out.slice(0, m!.index)
+	assert.ok(huge.llm_prompt.startsWith(kept))
+	assert.equal(Number(m![1]), huge.llm_prompt.length - kept.length)
 })
 
 test("fitUnifiedPrompt: a bound shorter than the note is still held", () => {
