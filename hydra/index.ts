@@ -7,7 +7,16 @@
  * same pattern stays in lockstep across client repos (per CONTRACT.md).
  */
 
-export { HydraDB, ContextResource, DatabasesResource } from "./client.ts"
+export {
+	HydraDB,
+	ContextResource,
+	DatabasesResource,
+	LAYOUT_TTL_MS,
+	UNIFIED_MAX_TEXT_BYTES,
+	UNIFIED_MAX_TITLE_BYTES,
+	UNIFIED_MAX_INSTRUCTIONS_CHARS,
+	unifiedAnswerToWire,
+} from "./client.ts"
 export type {
 	HydraConfig,
 	ContextKind,

@@ -79,7 +79,7 @@ export function toRecallResponse(data: SDK.SearchV2RetrievalResult): SplitRecall
 
 /** SDK ingest result → the legacy `AddMemoryResponse` (success/failed counts). */
 export function toAddMemoryResponse(
-	data: SDK.IngestionV2SourceUploadResponse,
+	data: SDK.IngestionV2IngestResponse,
 ): AddMemoryResponse {
 	// Read both spellings: the SDK deserialises to camelCase, but a wire-shaped
 	// payload (a mocked transport, an older raw path) must still count rather
@@ -112,7 +112,8 @@ export function toUnifiedAddMemoryResponse(data: UnifiedIngestResponse): AddMemo
 		success: data.success ?? false,
 		message: data.message ?? "",
 		results: rows.map((row) => ({
-			source_id: row.source_id ?? "",
+			// The 202 names the item's context_id `id`; older servers said `source_id`.
+			source_id: row.id ?? row.source_id ?? "",
 			title: row.title ?? null,
 			status: row.status ?? "",
 			infer: row.infer ?? false,
@@ -138,7 +139,7 @@ function asRecords(value: unknown): Record<string, unknown>[] | undefined {
 
 /** SDK list result → the legacy `ListMemoriesResponse`. Field names vary across v2 records, so read defensively. */
 export function toListMemoriesResponse(
-	data: SDK.ListV2SourceListResponse,
+	data: SDK.ListV2ListResponse,
 ): ListMemoriesResponse {
 	// Memories surface at top-level `user_memories` — not under an `.inner`
 	// wrapper, and not under `sources` (that is the knowledge shape).
@@ -164,7 +165,7 @@ export function toListMemoriesResponse(
 
 /** SDK list result → the legacy `ListSourcesResponse` (knowledge rows + total). */
 export function toListSourcesResponse(
-	data: SDK.ListV2SourceListResponse,
+	data: SDK.ListV2ListResponse,
 ): ListSourcesResponse {
 	// Knowledge sources surface at top-level `sources`, not under `.inner`.
 	const d = data as unknown as Record<string, unknown>

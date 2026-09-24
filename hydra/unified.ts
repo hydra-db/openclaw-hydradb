@@ -18,6 +18,9 @@
  */
 
 /** The declared context_category a unified chunk carries as `enrichment_kind`. */
+/** A database's storage layout (PRO-1618), from `GET /databases` `details[].type`. */
+export type Layout = "split" | "unified"
+
 export type UnifiedEnrichmentKind = "user_preference" | "business_knowledge" | "decision_trace"
 
 /**
@@ -103,10 +106,10 @@ export interface UnifiedQueryResponse {
 }
 
 /** One turn of a unified conversation item; roles are user | assistant | system. */
+/** A conversation turn is exactly {role, content} (hydradb-application#1653); the speaker is the item's `user_name`. */
 export interface UnifiedConversationTurn {
 	role: "user" | "assistant" | "system"
 	content: string
-	name?: string
 }
 
 /**
@@ -134,8 +137,9 @@ export interface UnifiedIngestItem {
 	/** A label the caller sets; nothing infers it. */
 	context_category?: "auto" | "user_preference" | "business_knowledge" | "decision_trace"
 	/** Caller-declared relations to other context_ids. Canonical name (never relations). */
-	forceful_relations?: { ids: string[]; properties?: Record<string, unknown> }
+	forceful_relations?: { context_ids: string[]; properties?: Record<string, unknown> }
 	acl?: string[]
+	user_name?: string
 }
 
 /** The JSON body of `POST /context/ingest` on a unified database. */
@@ -157,7 +161,10 @@ export interface UnifiedIngestRequest {
  * `infer` (not context_id / enrich): treat `source_id` as the context_id.
  */
 export interface UnifiedIngestResultItem {
-	source_id: string
+	/** The item's context_id. */
+	id?: string
+	/** The same, from servers that predate `id`. */
+	source_id?: string
 	title: string | null
 	status: "queued" | "failed" | string
 	infer: boolean
@@ -187,10 +194,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * the pre-rename `relations` key is not this contract, and nothing reads it.
  */
 export function isUnifiedQueryResponse(value: unknown): value is UnifiedQueryResponse {
+	// `forceful_relations` is optional in the contract; `relations` or a
+	// non-array value is still not the unified body.
 	return (
 		isRecord(value) &&
 		Array.isArray(value.graph) &&
-		Array.isArray(value.forceful_relations) &&
+		(Array.isArray(value.forceful_relations) || (value.forceful_relations === undefined && !("relations" in value))) &&
 		typeof value.llm_prompt === "string"
 	)
 }

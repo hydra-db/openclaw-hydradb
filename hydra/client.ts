@@ -29,12 +29,12 @@
  */
 
 import { Buffer } from "node:buffer"
-import { HydraDBClient, serialization } from "@hydradb/sdk"
+import { HydraDBClient, HydraDBEnvironment, serialization } from "@hydradb/sdk"
 import type { HydraDB as SDK } from "@hydradb/sdk"
 
 import { unwrap } from "./envelope.ts"
-import { translateError } from "./errors.ts"
-import { type Layout, RawHttp } from "./raw.ts"
+import { HydraWrapperError, translateError } from "./errors.ts"
+import type { Layout } from "./unified.ts"
 import {
 	isUnifiedQueryResponse,
 	type UnifiedConversationTurn,
@@ -44,12 +44,12 @@ import {
 	type UnifiedQueryResponse,
 } from "./unified.ts"
 
-export type { Layout } from "./raw.ts"
+export type { Layout } from "./unified.ts"
 
 /** What `query` resolves to: the SDK shape on a split database, the contract's four-key body on a unified one. */
 export type QueryResult = SDK.SearchV2RetrievalResult | UnifiedQueryResponse
 /** What `ingest` resolves to: the SDK shape on a split database, the contract's 202 on a unified one. */
-export type IngestResult = SDK.IngestionV2SourceUploadResponse | UnifiedIngestResponse
+export type IngestResult = SDK.IngestionV2IngestResponse | UnifiedIngestResponse
 
 /**
  * `unified` (PRO-1618) names the ONE corpus of a database created with
@@ -65,7 +65,8 @@ export type ContextKind = "memory" | "knowledge" | "unified"
  * so it is passed through with a cast rather than dropped.
  */
 function kindToType<T extends string>(kind: ContextKind | undefined): T | undefined {
-	return kind as T | undefined
+	// A unified database takes no `type` at all (PRO-1618).
+	return kind === "unified" ? undefined : (kind as T | undefined)
 }
 
 export interface HydraConfig {
@@ -77,7 +78,7 @@ export interface HydraConfig {
 	collection?: string
 	/** Optional base URL override; defaults to the SDK's environment. */
 	baseUrl?: string
-	/** Test seam for the hand-rolled v2 calls (see ./raw.ts); production uses global fetch. */
+	/** Test seam: the fetch the SDK uses; production uses global fetch. */
 	fetch?: typeof fetch
 }
 
@@ -199,11 +200,94 @@ const SDK_PARSE_OPTS: SdkParseOptions = {
 	breadcrumbsPrefix: ["response"],
 }
 
-/** Drop undefined values so a hand-built wire body carries only what was said. */
-function compact(record: Record<string, unknown>): Record<string, unknown> {
-	const out: Record<string, unknown> = {}
-	for (const [k, v] of Object.entries(record)) if (v !== undefined) out[k] = v
+/** The same leniency, for turning an SDK object back into its wire spelling. */
+const SDK_WIRE_OPTS: SdkParseOptions = {
+	unrecognizedObjectKeys: "passthrough",
+	allowUnrecognizedUnionMembers: true,
+	allowUnrecognizedEnumValues: true,
+	skipValidation: true,
+	breadcrumbsPrefix: ["request"],
+}
+
+/** The layout probe runs before the first call: a short budget, no retries. */
+const LAYOUT_PROBE_TIMEOUT_S = 5
+/** How long a probed layout is trusted; see DatabasesResource.layouts. */
+export const LAYOUT_TTL_MS = 5 * 60_000
+
+/** The server's per-item caps on a unified ingest (hydradb-application#1657). */
+export const UNIFIED_MAX_TEXT_BYTES = 1 << 20
+export const UNIFIED_MAX_TITLE_BYTES = 1024
+export const UNIFIED_MAX_INSTRUCTIONS_CHARS = 4000
+
+/**
+ * A unified /query answer in its wire spelling (`llm_prompt`,
+ * `forceful_relations`, `chunk_id`...). The SDK (2.1.6) reads the body
+ * through a union: when it matches its four-key model every key comes back
+ * camelCased, and when it does not (a chunk with `temporal`, say) the body
+ * comes back as sent. The same query can therefore answer in either spelling,
+ * so it is pinned to the wire one here, which is the contract's and what the
+ * renderers read. A legacy v2 body (an older server) is left as the SDK
+ * parsed it, exactly as the split path returns it.
+ */
+export function unifiedAnswerToWire(answer: unknown): unknown {
+	if (answer == null || typeof answer !== "object" || Array.isArray(answer)) return answer
+	const a = answer as Record<string, unknown>
+	if (isUnifiedQueryResponse(a)) return a
+	const firstChunk = Array.isArray(a.chunks) ? (a.chunks[0] as Record<string, unknown> | undefined) : undefined
+	const camelUnified =
+		Array.isArray(a.graph) || Array.isArray(a.forcefulRelations) || (firstChunk != null && "contextId" in firstChunk)
+	if (!camelUnified) return a
+	return serialization.SearchQueryResult.jsonOrThrow(a as unknown as SDK.SearchQueryResult, SDK_WIRE_OPTS)
+}
+
+/** `value` cut to at most `maxBytes` of UTF-8, never inside a character. */
+export function clipUtf8(value: string, maxBytes: number): string {
+	if (Buffer.byteLength(value, "utf-8") <= maxBytes) return value
+	let out = ""
+	let used = 0
+	for (const ch of value) {
+		const size = Buffer.byteLength(ch, "utf-8")
+		if (used + size > maxBytes) break
+		out += ch
+		used += size
+	}
 	return out
+}
+
+/**
+ * A conversation as unified turns (exactly {role, content}), keeping the
+ * LATEST pairs whose text fits the server's per-item cap. Auto-capture saves a
+ * whole session under one id on every turn, so a long session would otherwise
+ * be refused on every later turn and stop being saved at all.
+ */
+export function latestTurnsWithinCap(
+	pairs: { user: string; assistant: string }[],
+	maxBytes: number = UNIFIED_MAX_TEXT_BYTES,
+): UnifiedConversationTurn[] {
+	const kept: UnifiedConversationTurn[][] = []
+	let used = 0
+	for (let i = pairs.length - 1; i >= 0; i--) {
+		const pair = pairs[i]
+		const size = Buffer.byteLength(pair.user, "utf-8") + Buffer.byteLength(pair.assistant, "utf-8")
+		if (used + size > maxBytes) {
+			if (kept.length === 0) {
+				// Even the newest pair is over the cap: keep its latest text.
+				const room = Math.max(0, maxBytes - Buffer.byteLength(pair.user, "utf-8"))
+				const assistant = clipUtf8(pair.assistant, room)
+				kept.push([
+					{ role: "user", content: clipUtf8(pair.user, maxBytes) },
+					...(assistant ? [{ role: "assistant" as const, content: assistant }] : []),
+				])
+			}
+			break
+		}
+		used += size
+		kept.push([
+			{ role: "user", content: pair.user },
+			{ role: "assistant", content: pair.assistant },
+		])
+	}
+	return kept.reverse().flat()
 }
 
 /**
@@ -221,48 +305,7 @@ function parseMaybeJson(value: Record<string, unknown> | string): unknown {
 	}
 }
 
-function queryString(record: Record<string, string | number | undefined>): string {
-	const params = new URLSearchParams()
-	for (const [k, v] of Object.entries(record)) if (v !== undefined) params.set(k, String(v))
-	const encoded = params.toString()
-	return encoded === "" ? "" : `?${encoded}`
-}
-
 abstract class Resource {
-	/** Hand-rolled v2 transport for calls the pinned SDK cannot make; see ./raw.ts. */
-	protected raw?: RawHttp
-
-	/** @internal */
-	attachRaw(raw: RawHttp): void {
-		this.raw = raw
-	}
-
-	protected requireRaw(what: string): RawHttp {
-		if (!this.raw) {
-			throw new Error(`${what} needs the v2 transport, which this HydraDB instance was built without`)
-		}
-		return this.raw
-	}
-
-	/**
-	 * A raw v2 call whose wire result is run through the SDK's OWN response
-	 * serializer, so the caller gets the same camelCase object the SDK path
-	 * returns. Used for the unified list, relations and delete calls (PRO-1618),
-	 * which send no `type`: built by hand so the wire carries exactly the
-	 * contract's fields and nothing the pinned SDK's request serializers, which
-	 * know only the split enum, might add or reject.
-	 */
-	protected async rawTyped<T>(
-		what: string,
-		method: "GET" | "POST" | "DELETE",
-		path: string,
-		body: unknown,
-		parse: (raw: unknown, opts?: SdkParseOptions) => T,
-	): Promise<T> {
-		const wire = await this.requireRaw(what).request<unknown>(method, path, body)
-		return parse(wire, SDK_PARSE_OPTS)
-	}
-
 	protected constructor(
 		protected readonly sdk: HydraDBClient,
 		private readonly database: string,
@@ -293,32 +336,23 @@ export class ContextResource extends Resource {
 	/** The single retrieval entry point (SDK `client.query`). */
 	query(params: QueryParams): Promise<QueryResult> {
 		if (params.kind === "unified") {
-			// The contract body for a unified database (PRO-1618): the v2 request
-			// fields and NO `type` (absent is its default; memory and knowledge
-			// are 400 here). The answer is the four-key unified body, returned
-			// as it came off the wire. Its shape is detected, not assumed: a
-			// server still answering with the legacy shape is run through the
-			// SDK's deserialiser exactly as the split path is.
-			return this.call("/query", async () => {
-				const wire = await this.requireRaw("unified query").request<unknown>(
-					"POST",
-					"/query",
-					compact({
-						...this.scope(params.collection),
-						query: params.query,
-						operator: params.operator,
-						max_results: params.maxResults,
-						mode: params.mode,
-						graph_context: params.graphContext,
-						follow_forceful_relations: params.followForcefulRelations,
-						alpha: params.alpha,
-						recency_bias: params.recencyBias,
-					}),
-				)
-				return isUnifiedQueryResponse(wire)
-					? wire
-					: serialization.SearchV2RetrievalResult.parseOrThrow(wire, SDK_PARSE_OPTS)
-			})
+			// A unified database (PRO-1618): the v2 request fields and NO `type`
+			// (absent is its default; memory and knowledge are 400 there), sent
+			// through the SDK (2.1.6+ knows follow_forceful_relations). The answer
+			// is normalised to the four-key wire body; see unifiedAnswerToWire.
+			return this.call<unknown>("/query", () =>
+				this.sdk.query({
+					...this.scope(params.collection),
+					query: params.query,
+					operator: params.operator,
+					maxResults: params.maxResults,
+					mode: params.mode,
+					graphContext: params.graphContext,
+					followForcefulRelations: params.followForcefulRelations,
+					alpha: params.alpha,
+					recencyBias: params.recencyBias,
+				}),
+			).then((answer) => unifiedAnswerToWire(answer) as QueryResult)
 		}
 		return this.call("/query", () =>
 			this.sdk.query({
@@ -375,11 +409,13 @@ export class ContextResource extends Resource {
 			// Knowledge is multipart with the document as a file part — never the
 			// `app_sources` JSON field (guards the DX-G-002 class of bug).
 			if (params.text != null) {
-				request.documents = {
-					data: Buffer.from(params.text, "utf-8"),
-					filename: params.filename ?? `${params.title ?? "document"}.md`,
-					contentType: "text/markdown",
-				}
+				request.documents = [
+					{
+						data: Buffer.from(params.text, "utf-8"),
+						filename: params.filename ?? `${params.title ?? "document"}.md`,
+						contentType: "text/markdown",
+					},
+				]
 			}
 			if (params.title != null) {
 				request.documentMetadata = JSON.stringify({ title: params.title })
@@ -390,24 +426,34 @@ export class ContextResource extends Resource {
 	}
 
 	/**
-	 * The unified ingest body (PRO-1618): the JSON body of `POST /context/ingest`
-	 * with the canonical list key `context` (never `items`), one item that is
-	 * either `text` or a `conversation` of {role, content, name?} turns, and
-	 * the request-level `enrich` / `upsert` / `instructions` defaults. No corpus
-	 * selector. The 202 is returned as it came off the wire: its
-	 * `results[].source_id` is the item's context_id.
+	 * A unified ingest (PRO-1618) through the SDK: the `context` list (never
+	 * `items`) with one item that is either `text` or a `conversation` of
+	 * exactly {role, content} turns, the speaker as the item's `user_name`
+	 * (hydradb-application#1653), and the request-level `enrich` / `upsert` /
+	 * `instructions` defaults. No corpus selector. The SDK sends `context` as
+	 * its multipart form field. The server's per-item caps are held here: a
+	 * conversation keeps its LATEST turns within the text cap, the title and
+	 * instructions are clipped, and a single text over the cap is refused
+	 * before sending. The 202 comes back in its wire spelling.
 	 */
 	private ingestUnified(params: IngestParams): Promise<UnifiedIngestResponse> {
 		const item: UnifiedIngestItem = {}
 		if (params.sourceId != null) item.context_id = params.sourceId
-		if (params.title != null) item.title = params.title
-		if (params.text != null) item.text = params.text
-		if (params.pairs != null) {
-			item.conversation = params.pairs.flatMap((turn): UnifiedConversationTurn[] => [
-				{ role: "user", content: turn.user, ...(params.userName ? { name: params.userName } : {}) },
-				{ role: "assistant", content: turn.assistant },
-			])
+		if (params.title != null) item.title = clipUtf8(params.title, UNIFIED_MAX_TITLE_BYTES)
+		if (params.text != null) {
+			const bytes = Buffer.byteLength(params.text, "utf-8")
+			if (bytes > UNIFIED_MAX_TEXT_BYTES) {
+				return Promise.reject(
+					new HydraWrapperError(
+						`Hydra /context/ingest → ERR: the text is ${bytes} bytes; a unified database takes at most ${UNIFIED_MAX_TEXT_BYTES} per item`,
+						"/context/ingest",
+					),
+				)
+			}
+			item.text = params.text
 		}
+		if (params.pairs != null) item.conversation = latestTurnsWithinCap(params.pairs)
+		if (params.userName != null && params.userName.trim() !== "") item.user_name = params.userName
 		if (params.tenantMetadata != null) {
 			item.attributes = parseMaybeJson(params.tenantMetadata) as Record<string, unknown>
 		}
@@ -421,39 +467,32 @@ export class ContextResource extends Resource {
 			}
 		}
 		const enrich = params.infer ?? true
-		const body: UnifiedIngestRequest = {
-			...this.scope(params.collection),
-			context: [item],
-			enrich,
-			...(params.upsert != null ? { upsert: params.upsert } : {}),
-			// Same omission rule as the split item: instructions only steer
-			// enrichment, so they travel only when enrichment is on.
-			...(enrich && params.customInstructions != null ? { instructions: params.customInstructions } : {}),
-		}
-		return this.call("/context/ingest", () =>
-			this.requireRaw("unified ingest").request<UnifiedIngestResponse>("POST", "/context/ingest", body),
+		// Same omission rule as the split item: instructions only steer
+		// enrichment, so they travel only when enrichment is on.
+		const instructions =
+			enrich && params.customInstructions != null
+				? params.customInstructions.slice(0, UNIFIED_MAX_INSTRUCTIONS_CHARS)
+				: undefined
+		return this.call<unknown>("/context/ingest", () =>
+			this.sdk.context.ingest({
+				...this.scope(params.collection),
+				context: JSON.stringify([item]),
+				enrich: String(enrich),
+				...(params.upsert != null ? { upsert: String(params.upsert) } : {}),
+				...(instructions != null ? { instructions } : {}),
+			}),
+		).then(
+			(answer) =>
+				serialization.IngestionV2IngestResponse.jsonOrThrow(
+					answer as SDK.IngestionV2IngestResponse,
+					SDK_WIRE_OPTS,
+				) as unknown as UnifiedIngestResponse,
 		)
 	}
 
 	/** List memories or knowledge sources (SDK `context.list`). */
-	list(params: ListParams = {}): Promise<SDK.ListV2SourceListResponse> {
-		if (params.kind === "unified") {
-			// No `type` on a unified database (PRO-1618): absent is its default.
-			return this.call("/context/list", () =>
-				this.rawTyped(
-					"unified list",
-					"POST",
-					"/context/list",
-					compact({
-						...this.scope(params.collection),
-						ids: params.ids,
-						page: params.page,
-						page_size: params.pageSize,
-					}),
-					serialization.ListV2SourceListResponse.parseOrThrow,
-				),
-			)
-		}
+	list(params: ListParams = {}): Promise<SDK.ListV2ListResponse> {
+		// No `type` on a unified database (PRO-1618): absent is its default.
 		return this.call("/context/list", () =>
 			this.sdk.context.list({
 				...this.scope(params.collection),
@@ -493,25 +532,7 @@ export class ContextResource extends Resource {
 	relations(
 		params: RelationsParams = {},
 	): Promise<SDK.GraphGraphRelationsResponse> {
-		if (params.kind === "unified") {
-			// No `type` on a unified database (PRO-1618): absent is its default.
-			const scope = this.scope(params.collection)
-			return this.call("/context/relations", () =>
-				this.rawTyped(
-					"unified relations",
-					"GET",
-					`/context/relations${queryString({
-						database: scope.database,
-						collection: scope.collection,
-						id: params.id,
-						limit: params.limit,
-						cursor: params.cursor,
-					})}`,
-					undefined,
-					serialization.GraphGraphRelationsResponse.parseOrThrow,
-				),
-			)
-		}
+		// No `type` on a unified database (PRO-1618): absent is its default.
 		return this.call("/context/relations", () =>
 			this.sdk.context.relations({
 				...this.scope(params.collection),
@@ -525,18 +546,7 @@ export class ContextResource extends Resource {
 
 	/** Delete memories or knowledge sources (SDK `context.delete`). */
 	delete(params: DeleteParams): Promise<SDK.SourcesMemoryDeleteResponse> {
-		if (params.kind === "unified") {
-			// No `type` on a unified database (PRO-1618): absent is its default.
-			return this.call("/context", () =>
-				this.rawTyped(
-					"unified delete",
-					"DELETE",
-					"/context",
-					compact({ ...this.scope(params.collection), ids: params.ids }),
-					serialization.SourcesMemoryDeleteResponse.parseOrThrow,
-				),
-			)
-		}
+		// No `type` on a unified database (PRO-1618): absent is its default.
 		return this.call("/context", () =>
 			this.sdk.context.delete({
 				...this.scope(params.collection),
@@ -548,38 +558,72 @@ export class ContextResource extends Resource {
 }
 
 export class DatabasesResource extends Resource {
-	constructor(sdk: HydraDBClient, database: string, collection?: string) {
+	constructor(
+		sdk: HydraDBClient,
+		database: string,
+		collection?: string,
+		private readonly transport?: { token: string; baseUrl?: string; fetch?: typeof fetch },
+	) {
 		super(sdk, database, collection)
+	}
+
+	/**
+	 * `POST /databases` with `type: "unified"`, built by hand. The ONE call
+	 * the SDK cannot make: 2.1.6's storage-layout enum declares only "split",
+	 * and its request serializer refuses "unified" before sending ("Expected
+	 * enum"). Same headers and error shape as the SDK path. Drop this once
+	 * the SDK's enum carries "unified".
+	 */
+	private async createUnified(params: CreateDatabaseParams): Promise<SDK.TenantsTenantCreateAcceptedResponse> {
+		const path = "/databases"
+		const base = (this.transport?.baseUrl ?? HydraDBEnvironment.Default).replace(/\/+$/, "")
+		const doFetch = this.transport?.fetch ?? fetch
+		let res: Response
+		try {
+			res = await doFetch(`${base}${path}`, {
+				method: "POST",
+				headers: {
+					Authorization: `Bearer ${this.transport?.token ?? ""}`,
+					"API-Version": "2",
+					"Content-Type": "application/json",
+				},
+				body: JSON.stringify({
+					database: params.database,
+					type: "unified",
+					...(params.databaseMetadataSchema != null
+						? { database_metadata_schema: params.databaseMetadataSchema }
+						: {}),
+					...(params.embeddingsDimension != null ? { embeddings_dimension: params.embeddingsDimension } : {}),
+				}),
+			})
+		} catch (err) {
+			throw translateError(path, err)
+		}
+		const text = await res.text()
+		let body: unknown = text
+		try {
+			body = text ? JSON.parse(text) : {}
+		} catch {
+			// not JSON: keep the text
+		}
+		if (!res.ok) {
+			const detail = typeof body === "string" ? body : JSON.stringify(body)
+			throw new HydraWrapperError(`Hydra ${path} → ${res.status}: ${detail}`, path, { status: res.status, body })
+		}
+		return unwrap<SDK.TenantsTenantCreateAcceptedResponse>(body)
 	}
 
 	create(
 		params: CreateDatabaseParams,
 	): Promise<SDK.TenantsTenantCreateAcceptedResponse> {
-		if (params.type != null) {
-			// The pinned SDK's create request has no `type`; its serializer would
-			// drop it and provision a split database in silence.
-			return this.call("/databases", () =>
-				this.requireRaw("database create with a layout").request<SDK.TenantsTenantCreateAcceptedResponse>(
-					"POST",
-					"/databases",
-					{
-						database: params.database,
-						type: params.type,
-						...(params.databaseMetadataSchema != null
-							? { database_metadata_schema: params.databaseMetadataSchema }
-							: {}),
-						...(params.embeddingsDimension != null
-							? { embeddings_dimension: params.embeddingsDimension }
-							: {}),
-					},
-				),
-			)
-		}
+		if (params.type === "unified") return this.createUnified(params)
 		return this.call("/databases", () =>
 			this.sdk.databases.create({
 				database: params.database,
 				databaseMetadataSchema: params.databaseMetadataSchema,
 				embeddingsDimension: params.embeddingsDimension,
+				// "unified" was routed to createUnified above; the SDK's enum is "split" only.
+				type: params.type === "split" ? "split" : undefined,
 			}),
 		)
 	}
@@ -593,20 +637,28 @@ export class DatabasesResource extends Resource {
 	}
 
 	private layoutCache?: Promise<Map<string, Layout>>
+	private layoutCachedAt = 0
 
 	/**
 	 * Every database this key can see, with its storage layout (PRO-1618), from
-	 * `GET /databases` `details[]`. Memoised for the process: a layout is fixed
-	 * at creation, so it cannot go stale.
+	 * `GET /databases` `details[]`. The probe runs before the first call, so it
+	 * gets a short budget and no retries. The answer is kept for
+	 * LAYOUT_TTL_MS: the plugin runs for the life of the gateway, and a
+	 * database deleted and re-created under the other layout must not keep its
+	 * old one. A failed probe is not kept.
 	 */
 	layouts(): Promise<Map<string, Layout>> {
+		if (this.layoutCache && Date.now() - this.layoutCachedAt > LAYOUT_TTL_MS) this.layoutCache = undefined
 		if (!this.layoutCache) {
-			this.layoutCache = this.requireRaw("layout probe")
-				.request<{ details?: { database?: string; type?: string }[] }>("GET", "/databases")
+			this.layoutCachedAt = Date.now()
+			this.layoutCache = this.call<SDK.TenantsTenantIdsResponse>("/databases", () =>
+				this.sdk.databases.list({ timeoutInSeconds: LAYOUT_PROBE_TIMEOUT_S, maxRetries: 0 }),
+			)
 				.then((listed) => {
 					const map = new Map<string, Layout>()
 					for (const row of listed.details ?? []) {
-						if (row.database) map.set(row.database, row.type === "unified" ? "unified" : "split")
+						// The SDK's detail type declares only "split"; "unified" passes through untyped.
+						if (row.database) map.set(row.database, (row.type as string | undefined) === "unified" ? "unified" : "split")
 					}
 					return map
 				})
@@ -666,15 +718,13 @@ export class HydraDB {
 			new HydraDBClient({
 				token: config.token,
 				...(config.baseUrl != null ? { baseUrl: config.baseUrl } : {}),
+				...(config.fetch != null ? { fetch: config.fetch } : {}),
 			})
 		this.context = new ContextResource(client, config.database, config.collection)
-		this.databases = new DatabasesResource(
-			client,
-			config.database,
-			config.collection,
-		)
-		const raw = new RawHttp({ token: config.token, baseUrl: config.baseUrl, fetch: config.fetch })
-		this.context.attachRaw(raw)
-		this.databases.attachRaw(raw)
+		this.databases = new DatabasesResource(client, config.database, config.collection, {
+			token: config.token,
+			baseUrl: config.baseUrl,
+			fetch: config.fetch,
+		})
 	}
 }

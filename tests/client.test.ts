@@ -3,10 +3,10 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 
 import { HydraClient } from "../client.ts"
-import type { HydraPluginConfig } from "../config.ts"
+import { DEFAULT_MAX_RECALL_CHARS, parseConfig, type HydraPluginConfig } from "../config.ts"
 import { buildRecalledContext, envelopeForInjection } from "../context.ts"
 import { createRecallHook } from "../hooks/recall.ts"
-import { HydraDB, HydraWrapperError, isUnifiedQueryResponse } from "../hydra/index.ts"
+import { HydraDB, HydraWrapperError, isUnifiedQueryResponse, LAYOUT_TTL_MS } from "../hydra/index.ts"
 import type { UnifiedQueryResponse } from "../hydra/index.ts"
 import type { HydraDBClient } from "@hydradb/sdk"
 
@@ -471,9 +471,9 @@ test("unified recall surfaces the four-key body and the injected text is llm_pro
 	assert.ok(injected.prependContext.includes(UNIFIED_QUERY_FIXTURE.llm_prompt))
 })
 
-// No compaction (PRO-1618): an llm_prompt far past any plausible budget is
-// injected by the recall hook and returned by the search tool whole.
-test("a long unified llm_prompt is injected whole", async () => {
+// With no maxRecallChars (0 or unset), an llm_prompt far past any plausible
+// budget is injected by the recall hook whole.
+test("a long unified llm_prompt is injected whole when maxRecallChars is 0", async () => {
 	const llmPrompt = `# Query results\n\n${"y".repeat(50000)} END-OF-PROMPT`
 	const { client } = unifiedRecallClient({ ...UNIFIED_QUERY_FIXTURE, llm_prompt: llmPrompt })
 	const hook = createRecallHook(client, RECALL_CFG)
@@ -481,6 +481,38 @@ test("a long unified llm_prompt is injected whole", async () => {
 	assert.ok(injected && typeof injected.prependContext === "string")
 	assert.equal(injected.prependContext, envelopeForInjection(llmPrompt))
 	assert.ok(injected.prependContext.includes(llmPrompt), "the whole llm_prompt reaches the agent")
+})
+
+// PRO-2224: with maxRecallChars set (the parsed default is 16000), the hook
+// injects a bounded prompt that keeps the headings.
+test("the recall hook bounds a long unified llm_prompt by maxRecallChars", async () => {
+	const body = "lorem ipsum dolor sit amet ".repeat(4000)
+	const llmPrompt = `# Query results\n\n## Results\n\n### 1. doc-a\n**Id:** doc-a\n\n${body}\n\n## Sources\n\n1. **doc-a**`
+	const { client } = unifiedRecallClient({
+		...UNIFIED_QUERY_FIXTURE,
+		chunks: [{ chunk_id: "a_0", context_id: "doc-a", score: 0.9, content: body.trim() }],
+		forceful_relations: [],
+		llm_prompt: llmPrompt,
+	})
+	const hook = createRecallHook(client, { ...RECALL_CFG, maxRecallChars: 4000 })
+	const injected = await hook({ prompt: "who owns refund processing?" })
+	assert.ok(injected && typeof injected.prependContext === "string")
+	const inner = injected.prependContext
+	assert.ok(inner.length < 4000 + 600, `bounded (${inner.length})`)
+	assert.ok(inner.includes("### 1. doc-a") && inner.includes("**Id:** doc-a") && inner.includes("## Sources"))
+	assert.ok(inner.includes("[shortened:"))
+})
+
+// PRO-2224: on `before_prompt_build` the host's `currentUserMessage` is the
+// request; `prompt` may carry reconstructed history. An explicit empty string
+// means no textual request.
+test("the recall hook searches the host's currentUserMessage when it sends one", async () => {
+	const { client, calls } = unifiedRecallClient(UNIFIED_QUERY_FIXTURE)
+	const hook = createRecallHook(client, RECALL_CFG)
+	await hook({ prompt: "earlier turns...\nwho owns refund processing?", currentUserMessage: "who owns refund processing?" })
+	assert.equal(calls[0]!.args.query, "who owns refund processing?")
+	assert.equal(await hook({ prompt: "history only", currentUserMessage: "" }), undefined)
+	assert.equal(calls.length, 1, "no recall for an empty request")
 })
 
 // The server sends a blank llm_prompt when chunks, graph and forceful_relations
@@ -556,4 +588,35 @@ test("the layout-aware `all` advice is not mistaken for a layout answer", async 
 	const client = new HydraClient("k", "tenant-a", "sub-a", undefined, hydra)
 	await assert.rejects(() => client.ingestText("note"), /invalid type 'all'/)
 	assert.deepEqual(kinds, ["memory"], "no retry, and the split layout is not pinned to unified")
+})
+
+// PRO-2224: the plugin runs for the life of the gateway; a resolved layout is
+// re-checked after the TTL so a database re-created under the other layout is
+// not addressed as the old one. A pinned setting never expires.
+test("auto layout is re-resolved after the layout TTL", async (t) => {
+	let layout: "split" | "unified" = "split"
+	let probes = 0
+	const calls: Recorded[] = []
+	const hydra = {
+		context: { query: (args: Record<string, unknown>) => (calls.push({ method: "query", args }), Promise.resolve({})) },
+		databases: { layout: () => (probes++, Promise.resolve(layout)) },
+	} as unknown as HydraDB
+	const client = new HydraClient("k", "tenant-a", "sub-a", undefined, hydra)
+	t.mock.timers.enable({ apis: ["Date"], now: 1_000_000 })
+	await client.recall("q")
+	layout = "unified"
+	await client.recall("q")
+	t.mock.timers.tick(LAYOUT_TTL_MS + 1)
+	await client.recall("q")
+	assert.deepEqual(calls.map((c) => c.args.kind), ["memory", "memory", "unified"])
+	assert.equal(probes, 2)
+})
+
+test("maxRecallChars defaults to 16000, accepts 0 and refuses nonsense", () => {
+	const base = { apiKey: "k", tenantId: "t" }
+	assert.equal(parseConfig(base).maxRecallChars, DEFAULT_MAX_RECALL_CHARS)
+	assert.equal(parseConfig({ ...base, maxRecallChars: 0 }).maxRecallChars, 0)
+	assert.equal(parseConfig({ ...base, maxRecallChars: 5000 }).maxRecallChars, 5000)
+	assert.throws(() => parseConfig({ ...base, maxRecallChars: -1 }), /maxRecallChars/)
+	assert.throws(() => parseConfig({ ...base, maxRecallChars: "big" }), /maxRecallChars/)
 })

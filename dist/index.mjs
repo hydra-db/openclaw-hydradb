@@ -62,7 +62,8 @@ function toUnifiedAddMemoryResponse(data) {
     success: data.success ?? false,
     message: data.message ?? "",
     results: rows.map((row) => ({
-      source_id: row.source_id ?? "",
+      // The 202 names the item's context_id `id`; older servers said `source_id`.
+      source_id: row.id ?? row.source_id ?? "",
       title: row.title ?? null,
       status: row.status ?? "",
       infer: row.infer ?? false,
@@ -140,7 +141,7 @@ function toFetchContentResponse(data) {
 
 // hydra/client.ts
 import { Buffer } from "node:buffer";
-import { HydraDBClient, serialization } from "@hydradb/sdk";
+import { HydraDBClient, HydraDBEnvironment, serialization } from "@hydradb/sdk";
 
 // hydra/envelope.ts
 function isEnvelope(value) {
@@ -219,99 +220,12 @@ function translateError(path2, err) {
   });
 }
 
-// hydra/raw.ts
-var DEFAULT_BASE_URL = "https://api.hydradb.com";
-var RETRY_STATUSES = /* @__PURE__ */ new Set([408, 429, 500, 502, 503, 504]);
-var REPLAY_UNSAFE_WRITES = /* @__PURE__ */ new Set(["/context/ingest", "/databases"]);
-function isReplayUnsafe(method, operationPath) {
-  return method === "POST" && REPLAY_UNSAFE_WRITES.has(operationPath);
-}
-function operationPathOf(path2) {
-  const queryStart = path2.indexOf("?");
-  return queryStart === -1 ? path2 : path2.slice(0, queryStart);
-}
-var RawHttp = class {
-  constructor(config) {
-    this.config = config;
-    this.baseUrl = (config.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, "");
-    this.timeoutMs = config.timeoutMs ?? 3e4;
-    this.fetchImpl = config.fetch ?? fetch;
-    this.maxRetries = config.maxRetries ?? 2;
-  }
-  config;
-  baseUrl;
-  timeoutMs;
-  fetchImpl;
-  maxRetries;
-  /**
-   * The SDK's retry tolerance — 429/5xx and network failures, short backoff —
-   * with one carve-out: a failure that carried no status is NOT retried for a
-   * write that cannot be safely replayed. See REPLAY_UNSAFE_WRITES.
-   */
-  async request(method, path2, body) {
-    const operationPath = operationPathOf(path2);
-    let lastErr;
-    for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
-      try {
-        return await this.once(method, path2, body, operationPath);
-      } catch (err) {
-        lastErr = err;
-        const retryable = err instanceof HydraWrapperError && (err.status == null ? !isReplayUnsafe(method, operationPath) : RETRY_STATUSES.has(err.status));
-        if (!retryable || attempt === this.maxRetries) throw err;
-        await new Promise((resolve) => setTimeout(resolve, Math.min(250 * 2 ** attempt, 2e3)));
-      }
-    }
-    throw lastErr;
-  }
-  async once(method, path2, body, operationPath) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
-    try {
-      const response = await this.fetchImpl(`${this.baseUrl}${path2}`, {
-        method,
-        headers: {
-          Authorization: `Bearer ${this.config.token}`,
-          "Content-Type": "application/json",
-          // CONTRACT §2 rule 6: every v2 call names its version.
-          "API-Version": "2"
-        },
-        ...body !== void 0 ? { body: JSON.stringify(body) } : {},
-        signal: controller.signal
-      });
-      const text = await response.text();
-      let parsed;
-      try {
-        parsed = text === "" ? null : JSON.parse(text);
-      } catch {
-        parsed = text;
-      }
-      if (!response.ok) {
-        const detail = parsed && typeof parsed === "object" ? JSON.stringify(parsed) : String(parsed ?? "");
-        throw new HydraWrapperError(
-          `Hydra ${operationPath} \u2192 ${response.status}: ${detail}`,
-          operationPath,
-          { status: response.status, body: parsed }
-        );
-      }
-      return unwrap(parsed);
-    } catch (err) {
-      if (err instanceof HydraWrapperError) throw err;
-      const reason = err instanceof Error && err.name === "AbortError" ? `timed out after ${this.timeoutMs}ms` : err instanceof Error ? err.message : String(err);
-      throw new HydraWrapperError(`Hydra ${operationPath} \u2192 ERR: ${reason}`, operationPath, {
-        cause: err
-      });
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-};
-
 // hydra/unified.ts
 function isRecord(value) {
   return value != null && typeof value === "object" && !Array.isArray(value);
 }
 function isUnifiedQueryResponse(value) {
-  return isRecord(value) && Array.isArray(value.graph) && Array.isArray(value.forceful_relations) && typeof value.llm_prompt === "string";
+  return isRecord(value) && Array.isArray(value.graph) && (Array.isArray(value.forceful_relations) || value.forceful_relations === void 0 && !("relations" in value)) && typeof value.llm_prompt === "string";
 }
 function isUnifiedIngestResponse(value) {
   return isRecord(value) && typeof value.success_count === "number";
@@ -319,19 +233,65 @@ function isUnifiedIngestResponse(value) {
 
 // hydra/client.ts
 function kindToType(kind) {
-  return kind;
+  return kind === "unified" ? void 0 : kind;
 }
-var SDK_PARSE_OPTS = {
+var SDK_WIRE_OPTS = {
   unrecognizedObjectKeys: "passthrough",
   allowUnrecognizedUnionMembers: true,
   allowUnrecognizedEnumValues: true,
   skipValidation: true,
-  breadcrumbsPrefix: ["response"]
+  breadcrumbsPrefix: ["request"]
 };
-function compact(record) {
-  const out = {};
-  for (const [k, v] of Object.entries(record)) if (v !== void 0) out[k] = v;
+var LAYOUT_PROBE_TIMEOUT_S = 5;
+var LAYOUT_TTL_MS = 5 * 6e4;
+var UNIFIED_MAX_TEXT_BYTES = 1 << 20;
+var UNIFIED_MAX_TITLE_BYTES = 1024;
+var UNIFIED_MAX_INSTRUCTIONS_CHARS = 4e3;
+function unifiedAnswerToWire(answer) {
+  if (answer == null || typeof answer !== "object" || Array.isArray(answer)) return answer;
+  const a = answer;
+  if (isUnifiedQueryResponse(a)) return a;
+  const firstChunk = Array.isArray(a.chunks) ? a.chunks[0] : void 0;
+  const camelUnified = Array.isArray(a.graph) || Array.isArray(a.forcefulRelations) || firstChunk != null && "contextId" in firstChunk;
+  if (!camelUnified) return a;
+  return serialization.SearchQueryResult.jsonOrThrow(a, SDK_WIRE_OPTS);
+}
+function clipUtf8(value, maxBytes) {
+  if (Buffer.byteLength(value, "utf-8") <= maxBytes) return value;
+  let out = "";
+  let used = 0;
+  for (const ch of value) {
+    const size = Buffer.byteLength(ch, "utf-8");
+    if (used + size > maxBytes) break;
+    out += ch;
+    used += size;
+  }
   return out;
+}
+function latestTurnsWithinCap(pairs, maxBytes = UNIFIED_MAX_TEXT_BYTES) {
+  const kept = [];
+  let used = 0;
+  for (let i = pairs.length - 1; i >= 0; i--) {
+    const pair = pairs[i];
+    const size = Buffer.byteLength(pair.user, "utf-8") + Buffer.byteLength(pair.assistant, "utf-8");
+    if (used + size > maxBytes) {
+      if (kept.length === 0) {
+        const room = Math.max(0, maxBytes - Buffer.byteLength(pair.user, "utf-8"));
+        const assistant = clipUtf8(pair.assistant, room);
+        kept.push([
+          { role: "user", content: clipUtf8(pair.user, maxBytes) },
+          ...assistant ? [{ role: "assistant", content: assistant }] : []
+        ]);
+      }
+      break;
+    }
+    used += size;
+    kept.push([
+      { role: "user", content: pair.user },
+      { role: "assistant", content: pair.assistant }
+    ]);
+  }
+  return kept.reverse().flat();
 }
 function parseMaybeJson(value) {
   if (typeof value !== "string") return value;
@@ -340,12 +300,6 @@ function parseMaybeJson(value) {
   } catch {
     return { value };
   }
-}
-function queryString(record) {
-  const params = new URLSearchParams();
-  for (const [k, v] of Object.entries(record)) if (v !== void 0) params.set(k, String(v));
-  const encoded = params.toString();
-  return encoded === "" ? "" : `?${encoded}`;
 }
 var Resource = class {
   constructor(sdk, database, collection) {
@@ -356,30 +310,6 @@ var Resource = class {
   sdk;
   database;
   collection;
-  /** Hand-rolled v2 transport for calls the pinned SDK cannot make; see ./raw.ts. */
-  raw;
-  /** @internal */
-  attachRaw(raw) {
-    this.raw = raw;
-  }
-  requireRaw(what) {
-    if (!this.raw) {
-      throw new Error(`${what} needs the v2 transport, which this HydraDB instance was built without`);
-    }
-    return this.raw;
-  }
-  /**
-   * A raw v2 call whose wire result is run through the SDK's OWN response
-   * serializer, so the caller gets the same camelCase object the SDK path
-   * returns. Used for the unified list, relations and delete calls (PRO-1618),
-   * which send no `type`: built by hand so the wire carries exactly the
-   * contract's fields and nothing the pinned SDK's request serializers, which
-   * know only the split enum, might add or reject.
-   */
-  async rawTyped(what, method, path2, body, parse) {
-    const wire = await this.requireRaw(what).request(method, path2, body);
-    return parse(wire, SDK_PARSE_OPTS);
-  }
   scope(override) {
     const collection = override ?? this.collection;
     return collection != null ? { database: this.database, collection } : { database: this.database };
@@ -399,24 +329,20 @@ var ContextResource = class extends Resource {
   /** The single retrieval entry point (SDK `client.query`). */
   query(params) {
     if (params.kind === "unified") {
-      return this.call("/query", async () => {
-        const wire = await this.requireRaw("unified query").request(
-          "POST",
-          "/query",
-          compact({
-            ...this.scope(params.collection),
-            query: params.query,
-            operator: params.operator,
-            max_results: params.maxResults,
-            mode: params.mode,
-            graph_context: params.graphContext,
-            follow_forceful_relations: params.followForcefulRelations,
-            alpha: params.alpha,
-            recency_bias: params.recencyBias
-          })
-        );
-        return isUnifiedQueryResponse(wire) ? wire : serialization.SearchV2RetrievalResult.parseOrThrow(wire, SDK_PARSE_OPTS);
-      });
+      return this.call(
+        "/query",
+        () => this.sdk.query({
+          ...this.scope(params.collection),
+          query: params.query,
+          operator: params.operator,
+          maxResults: params.maxResults,
+          mode: params.mode,
+          graphContext: params.graphContext,
+          followForcefulRelations: params.followForcefulRelations,
+          alpha: params.alpha,
+          recencyBias: params.recencyBias
+        })
+      ).then((answer) => unifiedAnswerToWire(answer));
     }
     return this.call(
       "/query",
@@ -465,11 +391,13 @@ var ContextResource = class extends Resource {
       request.memories = JSON.stringify([item]);
     } else {
       if (params.text != null) {
-        request.documents = {
-          data: Buffer.from(params.text, "utf-8"),
-          filename: params.filename ?? `${params.title ?? "document"}.md`,
-          contentType: "text/markdown"
-        };
+        request.documents = [
+          {
+            data: Buffer.from(params.text, "utf-8"),
+            filename: params.filename ?? `${params.title ?? "document"}.md`,
+            contentType: "text/markdown"
+          }
+        ];
       }
       if (params.title != null) {
         request.documentMetadata = JSON.stringify({ title: params.title });
@@ -478,24 +406,34 @@ var ContextResource = class extends Resource {
     return this.call("/context/ingest", () => this.sdk.context.ingest(request));
   }
   /**
-   * The unified ingest body (PRO-1618): the JSON body of `POST /context/ingest`
-   * with the canonical list key `context` (never `items`), one item that is
-   * either `text` or a `conversation` of {role, content, name?} turns, and
-   * the request-level `enrich` / `upsert` / `instructions` defaults. No corpus
-   * selector. The 202 is returned as it came off the wire: its
-   * `results[].source_id` is the item's context_id.
+   * A unified ingest (PRO-1618) through the SDK: the `context` list (never
+   * `items`) with one item that is either `text` or a `conversation` of
+   * exactly {role, content} turns, the speaker as the item's `user_name`
+   * (hydradb-application#1653), and the request-level `enrich` / `upsert` /
+   * `instructions` defaults. No corpus selector. The SDK sends `context` as
+   * its multipart form field. The server's per-item caps are held here: a
+   * conversation keeps its LATEST turns within the text cap, the title and
+   * instructions are clipped, and a single text over the cap is refused
+   * before sending. The 202 comes back in its wire spelling.
    */
   ingestUnified(params) {
     const item = {};
     if (params.sourceId != null) item.context_id = params.sourceId;
-    if (params.title != null) item.title = params.title;
-    if (params.text != null) item.text = params.text;
-    if (params.pairs != null) {
-      item.conversation = params.pairs.flatMap((turn) => [
-        { role: "user", content: turn.user, ...params.userName ? { name: params.userName } : {} },
-        { role: "assistant", content: turn.assistant }
-      ]);
+    if (params.title != null) item.title = clipUtf8(params.title, UNIFIED_MAX_TITLE_BYTES);
+    if (params.text != null) {
+      const bytes = Buffer.byteLength(params.text, "utf-8");
+      if (bytes > UNIFIED_MAX_TEXT_BYTES) {
+        return Promise.reject(
+          new HydraWrapperError(
+            `Hydra /context/ingest \u2192 ERR: the text is ${bytes} bytes; a unified database takes at most ${UNIFIED_MAX_TEXT_BYTES} per item`,
+            "/context/ingest"
+          )
+        );
+      }
+      item.text = params.text;
     }
+    if (params.pairs != null) item.conversation = latestTurnsWithinCap(params.pairs);
+    if (params.userName != null && params.userName.trim() !== "") item.user_name = params.userName;
     if (params.tenantMetadata != null) {
       item.attributes = parseMaybeJson(params.tenantMetadata);
     }
@@ -507,39 +445,25 @@ var ContextResource = class extends Resource {
       }
     }
     const enrich = params.infer ?? true;
-    const body = {
-      ...this.scope(params.collection),
-      context: [item],
-      enrich,
-      ...params.upsert != null ? { upsert: params.upsert } : {},
-      // Same omission rule as the split item: instructions only steer
-      // enrichment, so they travel only when enrichment is on.
-      ...enrich && params.customInstructions != null ? { instructions: params.customInstructions } : {}
-    };
+    const instructions = enrich && params.customInstructions != null ? params.customInstructions.slice(0, UNIFIED_MAX_INSTRUCTIONS_CHARS) : void 0;
     return this.call(
       "/context/ingest",
-      () => this.requireRaw("unified ingest").request("POST", "/context/ingest", body)
+      () => this.sdk.context.ingest({
+        ...this.scope(params.collection),
+        context: JSON.stringify([item]),
+        enrich: String(enrich),
+        ...params.upsert != null ? { upsert: String(params.upsert) } : {},
+        ...instructions != null ? { instructions } : {}
+      })
+    ).then(
+      (answer) => serialization.IngestionV2IngestResponse.jsonOrThrow(
+        answer,
+        SDK_WIRE_OPTS
+      )
     );
   }
   /** List memories or knowledge sources (SDK `context.list`). */
   list(params = {}) {
-    if (params.kind === "unified") {
-      return this.call(
-        "/context/list",
-        () => this.rawTyped(
-          "unified list",
-          "POST",
-          "/context/list",
-          compact({
-            ...this.scope(params.collection),
-            ids: params.ids,
-            page: params.page,
-            page_size: params.pageSize
-          }),
-          serialization.ListV2SourceListResponse.parseOrThrow
-        )
-      );
-    }
     return this.call(
       "/context/list",
       () => this.sdk.context.list({
@@ -575,25 +499,6 @@ var ContextResource = class extends Resource {
   }
   /** Knowledge-graph relations (SDK `context.relations`). */
   relations(params = {}) {
-    if (params.kind === "unified") {
-      const scope = this.scope(params.collection);
-      return this.call(
-        "/context/relations",
-        () => this.rawTyped(
-          "unified relations",
-          "GET",
-          `/context/relations${queryString({
-            database: scope.database,
-            collection: scope.collection,
-            id: params.id,
-            limit: params.limit,
-            cursor: params.cursor
-          })}`,
-          void 0,
-          serialization.GraphGraphRelationsResponse.parseOrThrow
-        )
-      );
-    }
     return this.call(
       "/context/relations",
       () => this.sdk.context.relations({
@@ -607,18 +512,6 @@ var ContextResource = class extends Resource {
   }
   /** Delete memories or knowledge sources (SDK `context.delete`). */
   delete(params) {
-    if (params.kind === "unified") {
-      return this.call(
-        "/context",
-        () => this.rawTyped(
-          "unified delete",
-          "DELETE",
-          "/context",
-          compact({ ...this.scope(params.collection), ids: params.ids }),
-          serialization.SourcesMemoryDeleteResponse.parseOrThrow
-        )
-      );
-    }
     return this.call(
       "/context",
       () => this.sdk.context.delete({
@@ -630,31 +523,63 @@ var ContextResource = class extends Resource {
   }
 };
 var DatabasesResource = class extends Resource {
-  constructor(sdk, database, collection) {
+  constructor(sdk, database, collection, transport) {
     super(sdk, database, collection);
+    this.transport = transport;
+  }
+  transport;
+  /**
+   * `POST /databases` with `type: "unified"`, built by hand. The ONE call
+   * the SDK cannot make: 2.1.6's storage-layout enum declares only "split",
+   * and its request serializer refuses "unified" before sending ("Expected
+   * enum"). Same headers and error shape as the SDK path. Drop this once
+   * the SDK's enum carries "unified".
+   */
+  async createUnified(params) {
+    const path2 = "/databases";
+    const base = (this.transport?.baseUrl ?? HydraDBEnvironment.Default).replace(/\/+$/, "");
+    const doFetch = this.transport?.fetch ?? fetch;
+    let res;
+    try {
+      res = await doFetch(`${base}${path2}`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${this.transport?.token ?? ""}`,
+          "API-Version": "2",
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          database: params.database,
+          type: "unified",
+          ...params.databaseMetadataSchema != null ? { database_metadata_schema: params.databaseMetadataSchema } : {},
+          ...params.embeddingsDimension != null ? { embeddings_dimension: params.embeddingsDimension } : {}
+        })
+      });
+    } catch (err) {
+      throw translateError(path2, err);
+    }
+    const text = await res.text();
+    let body = text;
+    try {
+      body = text ? JSON.parse(text) : {};
+    } catch {
+    }
+    if (!res.ok) {
+      const detail = typeof body === "string" ? body : JSON.stringify(body);
+      throw new HydraWrapperError(`Hydra ${path2} \u2192 ${res.status}: ${detail}`, path2, { status: res.status, body });
+    }
+    return unwrap(body);
   }
   create(params) {
-    if (params.type != null) {
-      return this.call(
-        "/databases",
-        () => this.requireRaw("database create with a layout").request(
-          "POST",
-          "/databases",
-          {
-            database: params.database,
-            type: params.type,
-            ...params.databaseMetadataSchema != null ? { database_metadata_schema: params.databaseMetadataSchema } : {},
-            ...params.embeddingsDimension != null ? { embeddings_dimension: params.embeddingsDimension } : {}
-          }
-        )
-      );
-    }
+    if (params.type === "unified") return this.createUnified(params);
     return this.call(
       "/databases",
       () => this.sdk.databases.create({
         database: params.database,
         databaseMetadataSchema: params.databaseMetadataSchema,
-        embeddingsDimension: params.embeddingsDimension
+        embeddingsDimension: params.embeddingsDimension,
+        // "unified" was routed to createUnified above; the SDK's enum is "split" only.
+        type: params.type === "split" ? "split" : void 0
       })
     );
   }
@@ -665,14 +590,23 @@ var DatabasesResource = class extends Resource {
     return this.call("/databases", () => this.sdk.databases.list());
   }
   layoutCache;
+  layoutCachedAt = 0;
   /**
    * Every database this key can see, with its storage layout (PRO-1618), from
-   * `GET /databases` `details[]`. Memoised for the process: a layout is fixed
-   * at creation, so it cannot go stale.
+   * `GET /databases` `details[]`. The probe runs before the first call, so it
+   * gets a short budget and no retries. The answer is kept for
+   * LAYOUT_TTL_MS: the plugin runs for the life of the gateway, and a
+   * database deleted and re-created under the other layout must not keep its
+   * old one. A failed probe is not kept.
    */
   layouts() {
+    if (this.layoutCache && Date.now() - this.layoutCachedAt > LAYOUT_TTL_MS) this.layoutCache = void 0;
     if (!this.layoutCache) {
-      this.layoutCache = this.requireRaw("layout probe").request("GET", "/databases").then((listed) => {
+      this.layoutCachedAt = Date.now();
+      this.layoutCache = this.call(
+        "/databases",
+        () => this.sdk.databases.list({ timeoutInSeconds: LAYOUT_PROBE_TIMEOUT_S, maxRetries: 0 })
+      ).then((listed) => {
         const map = /* @__PURE__ */ new Map();
         for (const row of listed.details ?? []) {
           if (row.database) map.set(row.database, row.type === "unified" ? "unified" : "split");
@@ -723,17 +657,15 @@ var HydraDB = class {
   constructor(config, sdk) {
     const client = sdk ?? new HydraDBClient({
       token: config.token,
-      ...config.baseUrl != null ? { baseUrl: config.baseUrl } : {}
+      ...config.baseUrl != null ? { baseUrl: config.baseUrl } : {},
+      ...config.fetch != null ? { fetch: config.fetch } : {}
     });
     this.context = new ContextResource(client, config.database, config.collection);
-    this.databases = new DatabasesResource(
-      client,
-      config.database,
-      config.collection
-    );
-    const raw = new RawHttp({ token: config.token, baseUrl: config.baseUrl, fetch: config.fetch });
-    this.context.attachRaw(raw);
-    this.databases.attachRaw(raw);
+    this.databases = new DatabasesResource(client, config.database, config.collection, {
+      token: config.token,
+      baseUrl: config.baseUrl,
+      fetch: config.fetch
+    });
   }
 };
 
@@ -784,6 +716,7 @@ var HydraClient = class {
   hydra;
   layoutSetting;
   kindPromise;
+  kindResolvedAt = 0;
   constructor(apiKey, tenantId, subTenantId, baseUrl, hydra, layout = "auto") {
     this.tenantId = tenantId;
     this.subTenantId = subTenantId;
@@ -803,7 +736,11 @@ var HydraClient = class {
    * before. Resolved once per process; a failed probe reads as split.
    */
   kind() {
+    if (this.kindPromise && this.layoutSetting === "auto" && Date.now() - this.kindResolvedAt > LAYOUT_TTL_MS) {
+      this.kindPromise = void 0;
+    }
     if (!this.kindPromise) {
+      this.kindResolvedAt = Date.now();
       this.kindPromise = this.layoutSetting === "auto" ? Promise.resolve().then(() => this.hydra.databases.layout(this.tenantId)).then((layout) => layout === "unified" ? "unified" : "memory").catch(() => "memory") : Promise.resolve(this.layoutSetting === "unified" ? "unified" : "memory");
     }
     return this.kindPromise;
@@ -825,6 +762,7 @@ var HydraClient = class {
         log.warn("[hydra] the database is unified; switching every call to kind unified");
         const result = await run("unified");
         this.kindPromise = Promise.resolve("unified");
+        this.kindResolvedAt = Date.now();
         return result;
       }
       throw err;
@@ -1385,9 +1323,10 @@ function unifiedRecallLines(response) {
       if (summary) lines.push(`- ${summary}`);
     }
   }
-  if (response.forceful_relations.length > 0) {
+  const forceful = response.forceful_relations ?? [];
+  if (forceful.length > 0) {
     lines.push("Forceful relations:");
-    for (const rel of response.forceful_relations) {
+    for (const rel of forceful) {
       lines.push(`- [${rel.via.from} -> ${rel.via.to}] ${rel.chunk.content}`);
       detailLines(rel.chunk);
     }
@@ -1403,7 +1342,9 @@ function formatTriplet(triplet) {
   return `  (${src}) \u2014[${predicate}]\u2192 (${tgt})${ctx}`;
 }
 function buildRecalledContext(response, opts) {
-  if (isUnifiedQueryResponse(response)) return response.llm_prompt;
+  if (isUnifiedQueryResponse(response)) {
+    return opts?.maxChars ? fitUnifiedPrompt(response, opts.maxChars) : response.llm_prompt;
+  }
   const minScore = opts?.minEvidenceScore ?? 0.4;
   const chunks = response.chunks ?? [];
   const graphCtx = response.graph_context ?? {
@@ -1524,6 +1465,74 @@ function buildRecalledContext(response, opts) {
     output.push(chunkSections.join("\n\n---\n\n"));
   }
   return output.join("\n");
+}
+function cutAtWord(text, max) {
+  if (text.length <= max) return void 0;
+  const head = text.slice(0, max);
+  const space = head.lastIndexOf(" ");
+  return (space > max * 0.6 ? head.slice(0, space) : head).trimEnd();
+}
+function fitUnifiedPrompt(response, maxChars) {
+  const prompt = typeof response.llm_prompt === "string" ? response.llm_prompt : "";
+  if (prompt.length <= maxChars) return prompt;
+  const chunks = [
+    ...Array.isArray(response.chunks) ? response.chunks : [],
+    ...(response.forceful_relations ?? []).map((r) => r?.chunk).filter(Boolean)
+  ];
+  const bodies = [];
+  for (const chunk of chunks) {
+    for (const raw of [chunk.content, chunk.enrichment]) {
+      const text2 = typeof raw === "string" ? raw.trim() : "";
+      if (text2) bodies.push({ id: chunk.context_id || "", text: text2 });
+    }
+  }
+  const located = [];
+  for (const body of [...bodies].sort((x, y) => y.text.length - x.text.length)) {
+    for (let at = prompt.indexOf(body.text); at >= 0; at = prompt.indexOf(body.text, at + body.text.length)) {
+      if (!located.some((l) => at < l.at + l.text.length && l.at < at + body.text.length)) {
+        located.push({ ...body, at });
+      }
+    }
+  }
+  const noteAllowance = 90;
+  const fixed = prompt.length - located.reduce((n, l) => n + l.text.length, 0);
+  let cap = Number.POSITIVE_INFINITY;
+  if (located.length) {
+    let room = Math.max(0, maxChars - fixed - noteAllowance * located.length);
+    const sorted = located.map((l) => l.text.length).sort((x, y) => x - y);
+    let fill = room / sorted.length;
+    for (let i = 0; i < sorted.length && sorted[i] <= fill; i += 1) {
+      room -= sorted[i];
+      fill = sorted.length - i - 1 > 0 ? room / (sorted.length - i - 1) : fill;
+    }
+    cap = Math.max(120, Math.floor(fill));
+  }
+  let text = "";
+  let from = 0;
+  for (const l of [...located].sort((x, y) => x.at - y.at)) {
+    const cut = cutAtWord(l.text, cap);
+    text += prompt.slice(from, l.at);
+    from = l.at + l.text.length;
+    text += cut === void 0 ? l.text : `${cut} \u2026 [shortened: ${cut.length} of ${l.text.length} characters${l.id ? `, id ${l.id}` : ""}]`;
+  }
+  text += prompt.slice(from);
+  if (text.length > maxChars) {
+    const structural = /^(#{1,6} |- \*\*|- \[|\d+\. |---\s*$|\*\*Id:)/;
+    const lines = text.split("\n");
+    const candidates = lines.map((line, index) => ({ index, length: line.length })).filter((c2) => c2.length > 160 && !structural.test(lines[c2.index])).sort((x, y) => y.length - x.length);
+    for (const c2 of candidates) {
+      if (lines.join("\n").length <= maxChars) break;
+      lines[c2.index] = `${cutAtWord(lines[c2.index], 120) ?? lines[c2.index]} \u2026`;
+    }
+    text = lines.join("\n");
+  }
+  if (text.length > maxChars) {
+    const note = "\n[recall cut to fit the context budget]";
+    const head = text.slice(0, Math.max(0, maxChars - note.length));
+    const lastLine = head.lastIndexOf("\n");
+    text = (lastLine > head.length * 0.8 ? head.slice(0, lastLine) : head) + note;
+  }
+  return text;
 }
 function envelopeForInjection(contextBody) {
   if (!contextBody.trim()) return "";
@@ -1741,6 +1750,7 @@ var KNOWN_KEYS = /* @__PURE__ */ new Set([
   "autoRecall",
   "autoCapture",
   "maxRecallResults",
+  "maxRecallChars",
   "recallMode",
   "graphContext",
   "ignoreTerm",
@@ -1807,12 +1817,19 @@ function parseConfig(raw) {
     autoRecall: cfg.autoRecall ?? true,
     autoCapture: cfg.autoCapture ?? true,
     maxRecallResults: cfg.maxRecallResults ?? 10,
+    maxRecallChars: parseMaxRecallChars(cfg.maxRecallChars),
     recallMode: cfg.recallMode === "thinking" ? "thinking" : "fast",
     graphContext: cfg.graphContext ?? true,
     ignoreTerm: typeof cfg.ignoreTerm === "string" && cfg.ignoreTerm.length > 0 ? cfg.ignoreTerm : DEFAULT_IGNORE_TERM,
     debug: cfg.debug ?? false,
     layout: parseLayout(cfg.layout)
   };
+}
+var DEFAULT_MAX_RECALL_CHARS = 16e3;
+function parseMaxRecallChars(value) {
+  if (value === void 0) return DEFAULT_MAX_RECALL_CHARS;
+  if (typeof value === "number" && Number.isInteger(value) && value >= 0) return value;
+  throw new Error("hydra-db: maxRecallChars must be a whole number of characters, 0 for no bound");
 }
 function parseLayout(value) {
   if (value === void 0) return "auto";
@@ -1968,7 +1985,7 @@ ${t.user}` : t.user,
 // hooks/recall.ts
 function createRecallHook(client, cfg) {
   return async (event) => {
-    const prompt = event.prompt;
+    const prompt = typeof event.currentUserMessage === "string" ? event.currentUserMessage : event.prompt;
     if (!prompt || prompt.length < 5) return;
     if (containsIgnoreTerm(prompt, cfg.ignoreTerm)) {
       log.debug(`recall skipped \u2014 prompt contains ignore term "${cfg.ignoreTerm}"`);
@@ -1985,7 +2002,7 @@ function createRecallHook(client, cfg) {
         log.debug("no memories matched");
         return;
       }
-      const body = buildRecalledContext(response);
+      const body = buildRecalledContext(response, { maxChars: cfg.maxRecallChars });
       if (!body.trim()) return;
       const envelope = envelopeForInjection(body);
       log.debug(`injecting ${response.chunks.length} chunks (${envelope.length} chars)`);
@@ -2177,7 +2194,7 @@ function registerSearchTool(api, client, cfg) {
             content: [{ type: "text", text: "No relevant memories found." }]
           };
         }
-        const contextStr = buildRecalledContext(res);
+        const contextStr = buildRecalledContext(res, { maxChars: cfg.maxRecallChars });
         return {
           content: [
             {
@@ -2332,11 +2349,11 @@ var index_default = {
     if (cfg.autoRecall) {
       const onRecall = createRecallHook(client, cfg);
       api.on(
-        "before_agent_start",
+        "before_prompt_build",
         (event, ctx) => {
           if (ctx.sessionId) activeSessionId = ctx.sessionId;
           if (Array.isArray(event.messages)) conversationMessages = event.messages;
-          log.debug(`[session] before_agent_start \u2014 sid=${activeSessionId ?? "none"} msgs=${conversationMessages.length}`);
+          log.debug(`[session] before_prompt_build \u2014 sid=${activeSessionId ?? "none"} msgs=${conversationMessages.length}`);
           return onRecall(event);
         }
       );

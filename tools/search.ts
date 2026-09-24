@@ -45,9 +45,9 @@ export function registerSearchTool(
 					}
 				}
 
-				// On a unified database this is the server's `llm_prompt`, verbatim
-				// (PRO-1618); on a split one it is the legacy rendering, unchanged.
-				const contextStr = buildRecalledContext(res)
+				// On a unified database this is the server's `llm_prompt`, bounded by
+				// maxRecallChars (PRO-2224); on a split one the legacy rendering, unchanged.
+				const contextStr = buildRecalledContext(res, { maxChars: cfg.maxRecallChars })
 
 				return {
 					content: [

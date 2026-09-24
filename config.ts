@@ -6,6 +6,12 @@ export type HydraPluginConfig = {
 	autoRecall: boolean
 	autoCapture: boolean
 	maxRecallResults: number
+	/**
+	 * Upper bound, in characters, on a unified recall's `llm_prompt` as it is
+	 * injected or returned by the search tool (PRO-2224). Only long result
+	 * bodies are shortened, never a heading, id or citation label. 0 = no bound.
+	 */
+	maxRecallChars: number
 	recallMode: "fast" | "thinking"
 	graphContext: boolean
 	ignoreTerm: string
@@ -24,6 +30,7 @@ const KNOWN_KEYS = new Set([
 	"autoRecall",
 	"autoCapture",
 	"maxRecallResults",
+	"maxRecallChars",
 	"recallMode",
 	"graphContext",
 	"ignoreTerm",
@@ -128,6 +135,7 @@ export function parseConfig(raw: unknown): HydraPluginConfig {
 		autoRecall: (cfg.autoRecall as boolean) ?? true,
 		autoCapture: (cfg.autoCapture as boolean) ?? true,
 		maxRecallResults: (cfg.maxRecallResults as number) ?? 10,
+		maxRecallChars: parseMaxRecallChars(cfg.maxRecallChars),
 		recallMode:
 			cfg.recallMode === "thinking"
 				? ("thinking" as const)
@@ -140,6 +148,14 @@ export function parseConfig(raw: unknown): HydraPluginConfig {
 		debug: (cfg.debug as boolean) ?? false,
 		layout: parseLayout(cfg.layout),
 	}
+}
+
+export const DEFAULT_MAX_RECALL_CHARS = 16_000
+
+function parseMaxRecallChars(value: unknown): number {
+	if (value === undefined) return DEFAULT_MAX_RECALL_CHARS
+	if (typeof value === "number" && Number.isInteger(value) && value >= 0) return value
+	throw new Error("hydra-db: maxRecallChars must be a whole number of characters, 0 for no bound")
 }
 
 function parseLayout(value: unknown): "split" | "unified" | "auto" {

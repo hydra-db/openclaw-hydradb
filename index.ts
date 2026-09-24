@@ -85,12 +85,16 @@ export default {
 
 		if (cfg.autoRecall) {
 			const onRecall = createRecallHook(client, cfg)
+			// `before_prompt_build`, not the legacy `before_agent_start`: OpenClaw
+			// 2026.5.x marks that one compatibility-only and 2026.9.x no longer
+			// has it, so auto-recall never ran there. Both versions run this
+			// hook with the same `prependContext` result (PRO-2224).
 			api.on(
-				"before_agent_start",
+				"before_prompt_build",
 				(event: Record<string, unknown>, ctx: Record<string, unknown>) => {
 					if (ctx.sessionId) activeSessionId = ctx.sessionId as string
 					if (Array.isArray(event.messages)) conversationMessages = event.messages
-					log.debug(`[session] before_agent_start — sid=${activeSessionId ?? "none"} msgs=${conversationMessages.length}`)
+					log.debug(`[session] before_prompt_build — sid=${activeSessionId ?? "none"} msgs=${conversationMessages.length}`)
 					return onRecall(event)
 				},
 			)
