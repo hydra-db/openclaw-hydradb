@@ -8,7 +8,7 @@
     "access": "public"
   },
   "dependencies": {
-    "@hydradb/sdk": "2.1.2",
+    "@hydradb/sdk": "2.1.6",
     "@sinclair/typebox": "0.34.47"
   },
   "scripts": {

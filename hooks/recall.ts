@@ -9,7 +9,13 @@ export function createRecallHook(
 	cfg: HydraPluginConfig,
 ) {
 	return async (event: Record<string, unknown>) => {
-		const prompt = event.prompt as string | undefined
+		// `prompt` may carry reconstructed history on `before_prompt_build`; the
+		// host's `currentUserMessage`, when it sends one, is the request itself.
+		// An explicit empty string means no textual request: nothing to recall.
+		const prompt =
+			typeof event.currentUserMessage === "string"
+				? event.currentUserMessage
+				: (event.prompt as string | undefined)
 		if (!prompt || prompt.length < 5) return
 
 		if (containsIgnoreTerm(prompt, cfg.ignoreTerm)) {
@@ -31,9 +37,9 @@ export function createRecallHook(
 				return
 			}
 
-			// On a unified database this is the server's `llm_prompt`, verbatim
-			// (PRO-1618); on a split one it is the legacy rendering, unchanged.
-			const body = buildRecalledContext(response)
+			// On a unified database this is the server's `llm_prompt`, bounded by
+			// maxRecallChars (PRO-2224); on a split one the legacy rendering, unchanged.
+			const body = buildRecalledContext(response, { maxChars: cfg.maxRecallChars })
 			if (!body.trim()) return
 
 			const envelope = envelopeForInjection(body)

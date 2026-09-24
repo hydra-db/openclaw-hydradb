@@ -1,7 +1,7 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
 
-import { buildRecalledContext, recallIsEmpty, unifiedRecallLines } from "../context.ts"
+import { buildRecalledContext, fitUnifiedPrompt, recallIsEmpty, unifiedRecallLines } from "../context.ts"
 import { isUnifiedQueryResponse } from "../hydra/unified.ts"
 import type { RecallResponse, UnifiedQueryResponse } from "../types/hydra.ts"
 
@@ -235,4 +235,72 @@ test("unified structured lines and llm_prompt are never truncated", () => {
 		"a forceful relation carries its enrichment too",
 	)
 	assert.ok(!lines.some((line) => line.includes("…")), "nothing is elided")
+})
+
+// PRO-2224: a unified recall is bounded by maxRecallChars without losing a
+// citation. Same algorithm as the MCP and Claude Code clients.
+function bigUnified(n: number, bodyChars: number): UnifiedQueryResponse {
+	const chunks = Array.from({ length: n }, (_, i) => ({
+		chunk_id: `c${i}_0`,
+		context_id: `ctx-${i}`,
+		score: 0.9 - i / 100,
+		content: `Body ${i}: ${"lorem ipsum dolor sit amet ".repeat(Math.ceil(bodyChars / 27)).slice(0, bodyChars)}`,
+	}))
+	const prompt = [
+		"# Query results",
+		"",
+		"## Results",
+		...chunks.flatMap((c, i) => [`### ${i + 1}. ${c.context_id}`, `**Id:** ${c.context_id}`, "", c.content, ""]),
+		"## Related facts",
+		"- [P1] A -> works at -> B",
+		"",
+		"## Sources",
+		...chunks.map((c, i) => `${i + 1}. **${c.context_id}** (id: ${c.context_id})`),
+	].join("\n")
+	return { chunks, graph: [], forceful_relations: [], llm_prompt: prompt }
+}
+
+test("fitUnifiedPrompt: a prompt that fits is returned as sent", () => {
+	const small = bigUnified(3, 200)
+	assert.equal(fitUnifiedPrompt(small, 50_000), small.llm_prompt)
+	assert.equal(buildRecalledContext(small, { maxChars: 50_000 }), small.llm_prompt)
+	assert.equal(buildRecalledContext(small), small.llm_prompt, "no bound when maxChars is absent")
+})
+
+test("fitUnifiedPrompt: a big answer is bounded and keeps every heading, id and label", () => {
+	const big = bigUnified(20, 12_000)
+	assert.ok(big.llm_prompt.length > 200_000)
+	const out = fitUnifiedPrompt(big, 16_000)
+	assert.ok(out.length <= 16_000, `bounded (${out.length})`)
+	for (let i = 0; i < 20; i++) {
+		assert.ok(out.includes(`### ${i + 1}. ctx-${i}`), `heading ${i + 1} kept`)
+		assert.ok(out.includes(`**Id:** ctx-${i}`), `id ${i} kept`)
+		assert.ok(out.includes(`[shortened:`) && out.includes(`id ctx-${i}]`), `body ${i} marked with its id`)
+	}
+	assert.ok(out.includes("- [P1] A -> works at -> B"), "related facts kept")
+	assert.ok(out.includes("## Sources"), "sources kept")
+})
+
+test("fitUnifiedPrompt: the bound holds even when the structure alone is over it", () => {
+	const huge = bigUnified(200, 50)
+	const out = fitUnifiedPrompt(huge, 2_000)
+	assert.ok(out.length <= 2_000, `bounded (${out.length})`)
+	const m = /\n\[recall cut to fit the context budget: (\d+) more characters not shown\]$/.exec(out)
+	assert.ok(m, "the note ends the text")
+	// Bodies of 50 characters and short lines: nothing is shortened before the
+	// cut, so the count must be exactly the prompt characters not kept.
+	const kept = out.slice(0, m!.index)
+	assert.ok(huge.llm_prompt.startsWith(kept))
+	assert.equal(Number(m![1]), huge.llm_prompt.length - kept.length)
+})
+
+test("fitUnifiedPrompt: a bound shorter than the note is still held", () => {
+	const huge = bigUnified(50, 50)
+	for (const bound of [1, 10, 40]) assert.ok(fitUnifiedPrompt(huge, bound).length <= bound, `bound ${bound}`)
+})
+
+test("fitUnifiedPrompt: an answer without forceful_relations is bounded too", () => {
+	const { forceful_relations: _f, ...noForceful } = bigUnified(10, 10_000)
+	const out = fitUnifiedPrompt(noForceful as UnifiedQueryResponse, 8_000)
+	assert.ok(out.length <= 8_000)
 })

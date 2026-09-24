@@ -50,6 +50,12 @@
 			"help": "Maximum memory chunks injected into context per turn",
 			"advanced": true
 		},
+		"maxRecallChars": {
+			"label": "Max Recall Characters",
+			"placeholder": "16000",
+			"help": "Unified databases: upper bound on recalled context per turn. Long result bodies are shortened; headings, ids and citations are kept. 0 = no bound",
+			"advanced": true
+		},
 		"recallMode": {
 			"label": "Recall Mode",
 			"help": "'fast' (default) or 'thinking' (personalised recall with deeper graph traversal)",
@@ -87,6 +93,7 @@
 			"layout": { "type": "string", "enum": ["auto", "split", "unified"] },
 			"autoCapture": { "type": "boolean" },
 			"maxRecallResults": { "type": "number", "minimum": 1, "maximum": 50 },
+			"maxRecallChars": { "type": "integer", "minimum": 0 },
 			"recallMode": { "type": "string", "enum": ["fast", "thinking"] },
 			"graphContext": { "type": "boolean" },
 			"ignoreTerm": { "type": "string" },

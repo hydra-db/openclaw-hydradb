@@ -13,6 +13,7 @@ import {
 	isUnifiedIngestResponse,
 	isUnifiedLayoutRefusal,
 	isUnifiedQueryResponse,
+	LAYOUT_TTL_MS,
 } from "./hydra/index.ts"
 import type { ContextKind, IngestResult, Layout } from "./hydra/index.ts"
 import { log } from "./log.ts"
@@ -65,6 +66,7 @@ export class HydraClient {
 	private hydra: HydraDB
 	private layoutSetting: LayoutSetting
 	private kindPromise?: Promise<ContextKind>
+	private kindResolvedAt = 0
 
 	constructor(
 		apiKey: string,
@@ -97,7 +99,15 @@ export class HydraClient {
 	 * before. Resolved once per process; a failed probe reads as split.
 	 */
 	private kind(): Promise<ContextKind> {
+		// Re-resolved after the layout TTL: the plugin runs for the life of the
+		// gateway, and a database re-created under the other layout must not
+		// keep being addressed as the old one (PRO-2224). A pinned setting never
+		// expires.
+		if (this.kindPromise && this.layoutSetting === "auto" && Date.now() - this.kindResolvedAt > LAYOUT_TTL_MS) {
+			this.kindPromise = undefined
+		}
 		if (!this.kindPromise) {
+			this.kindResolvedAt = Date.now()
 			this.kindPromise =
 				this.layoutSetting === "auto"
 					? Promise.resolve()
@@ -133,6 +143,7 @@ export class HydraClient {
 				// timeout, a 500) left the process sending `unified` for its
 				// whole lifetime against a database that may well be split.
 				this.kindPromise = Promise.resolve<ContextKind>("unified")
+				this.kindResolvedAt = Date.now()
 				return result
 			}
 			throw err

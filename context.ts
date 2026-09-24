@@ -51,9 +51,10 @@ export function unifiedRecallLines(response: UnifiedQueryResponse): string[] {
 			if (summary) lines.push(`- ${summary}`)
 		}
 	}
-	if (response.forceful_relations.length > 0) {
+	const forceful = response.forceful_relations ?? []
+	if (forceful.length > 0) {
 		lines.push("Forceful relations:")
-		for (const rel of response.forceful_relations) {
+		for (const rel of forceful) {
 			lines.push(`- [${rel.via.from} -> ${rel.via.to}] ${rel.chunk.content}`)
 			detailLines(rel.chunk)
 		}
@@ -76,13 +77,18 @@ export function buildRecalledContext(
 	opts?: {
 		maxGroupOccurrences?: number
 		minEvidenceScore?: number
+		/** Unified only: bound on the prompt, see fitUnifiedPrompt. 0 or absent = none. */
+		maxChars?: number
 	},
 ): string {
 	// PRO-1618: a unified database ships its own rendering. `llm_prompt` is the
 	// server-built, citation-labelled string the contract says to surface to
-	// the agent verbatim, so nothing is rebuilt from chunks[] / graph[] here,
-	// and it is returned whole: never truncated, summarised or budgeted.
-	if (isUnifiedQueryResponse(response)) return response.llm_prompt
+	// the agent, so nothing is rebuilt from chunks[] / graph[] here. It goes
+	// out as sent when it fits `maxChars`; otherwise fitUnifiedPrompt shortens
+	// long result bodies only (PRO-2224).
+	if (isUnifiedQueryResponse(response)) {
+		return opts?.maxChars ? fitUnifiedPrompt(response, opts.maxChars) : response.llm_prompt
+	}
 
 	const minScore = opts?.minEvidenceScore ?? 0.4
 
@@ -229,6 +235,118 @@ export function buildRecalledContext(
 	}
 
 	return output.join("\n")
+}
+
+function cutAtWord(text: string, max: number): string | undefined {
+	if (text.length <= max) return undefined
+	const head = text.slice(0, max)
+	const space = head.lastIndexOf(" ")
+	return (space > max * 0.6 ? head.slice(0, space) : head).trimEnd()
+}
+
+/**
+ * A unified recall's `llm_prompt` fitted into `maxChars` without losing a
+ * citation (PRO-2224; the same algorithm as the MCP and Claude Code clients).
+ * One answer can run to hundreds of thousands of characters, and it is
+ * injected on every turn.
+ *
+ * The server writes each result's content and enrichment into the prompt
+ * verbatim, and that text can itself be Markdown, so the prompt's lines are
+ * not parsed for structure. The answer's own chunks say which text is result
+ * body: every copy of it is found in the prompt and shortened in place,
+ * sharing the room left by everything else, each cut marked with the item's
+ * id. Headings, ids, labels and the related-facts section are not touched.
+ * If the prompt is still over, long non-structural lines are shortened. Only
+ * when the structure alone exceeds the bound is the tail cut at a line with a
+ * note, so the bound always holds; that last resort can drop later results'
+ * headings and labels. A prompt that fits is returned as sent.
+ */
+export function fitUnifiedPrompt(response: UnifiedQueryResponse, maxChars: number): string {
+	const prompt = typeof response.llm_prompt === "string" ? response.llm_prompt : ""
+	if (prompt.length <= maxChars) return prompt
+	const chunks = [
+		...(Array.isArray(response.chunks) ? response.chunks : []),
+		...(response.forceful_relations ?? []).map((r) => r?.chunk).filter(Boolean),
+	]
+	const bodies: { id: string; text: string }[] = []
+	for (const chunk of chunks) {
+		for (const raw of [chunk.content, chunk.enrichment]) {
+			const text = typeof raw === "string" ? raw.trim() : ""
+			if (text) bodies.push({ id: chunk.context_id || "", text })
+		}
+	}
+	// Every occurrence of every body, longest first; a span overlapping one
+	// already claimed is left to it (a result that is also a forceful relation
+	// appears twice).
+	const located: { id: string; text: string; at: number }[] = []
+	for (const body of [...bodies].sort((x, y) => y.text.length - x.text.length)) {
+		for (let at = prompt.indexOf(body.text); at >= 0; at = prompt.indexOf(body.text, at + body.text.length)) {
+			if (!located.some((l) => at < l.at + l.text.length && l.at < at + body.text.length)) {
+				located.push({ ...body, at })
+			}
+		}
+	}
+
+	const noteAllowance = 90
+	const fixed = prompt.length - located.reduce((n, l) => n + l.text.length, 0)
+	let cap = Number.POSITIVE_INFINITY
+	if (located.length) {
+		let room = Math.max(0, maxChars - fixed - noteAllowance * located.length)
+		const sorted = located.map((l) => l.text.length).sort((x, y) => x - y)
+		let fill = room / sorted.length
+		for (let i = 0; i < sorted.length && sorted[i]! <= fill; i += 1) {
+			room -= sorted[i]!
+			fill = sorted.length - i - 1 > 0 ? room / (sorted.length - i - 1) : fill
+		}
+		cap = Math.max(120, Math.floor(fill))
+	}
+
+	let text = ""
+	let from = 0
+	for (const l of [...located].sort((x, y) => x.at - y.at)) {
+		const cut = cutAtWord(l.text, cap)
+		text += prompt.slice(from, l.at)
+		from = l.at + l.text.length
+		text +=
+			cut === undefined
+				? l.text
+				: `${cut} … [shortened: ${cut.length} of ${l.text.length} characters${l.id ? `, id ${l.id}` : ""}]`
+	}
+	text += prompt.slice(from)
+
+	// Still over: shorten every long line that is not the prompt's own
+	// structure, longest first, so headings, ids and [n]/[Rn]/[Pn] labels
+	// survive. Only if that is not enough does the prefix cut apply.
+	if (text.length > maxChars) {
+		const structural = /^(#{1,6} |- \*\*|- \[|\d+\. |---\s*$|\*\*Id:)/
+		const lines = text.split("\n")
+		const candidates = lines
+			.map((line, index) => ({ index, length: line.length }))
+			.filter((c) => c.length > 160 && !structural.test(lines[c.index]!))
+			.sort((x, y) => y.length - x.length)
+		for (const c of candidates) {
+			if (lines.join("\n").length <= maxChars) break
+			lines[c.index] = `${cutAtWord(lines[c.index]!, 120) ?? lines[c.index]} …`
+		}
+		text = lines.join("\n")
+	}
+
+	// Last resort, only when the answer's own structure (headings, ids,
+	// sources, facts) is over the bound: the bound holds and the tail is cut,
+	// so later results can lose their headings and labels here. The note says
+	// how much was cut. A bound shorter than the note is a plain prefix.
+	if (text.length > maxChars) {
+		// The note is sized with the largest count it could show, so the text
+		// kept is fixed before the count is: it then reports exactly what was cut.
+		const noteFor = (n: number) => `\n[recall cut to fit the context budget: ${n} more characters not shown]`
+		const room = noteFor(text.length).length
+		if (maxChars <= room) return text.slice(0, maxChars)
+		const head = text.slice(0, maxChars - room)
+		const lastLine = head.lastIndexOf("\n")
+		const kept = lastLine > head.length * 0.8 ? head.slice(0, lastLine) : head
+		text = kept + noteFor(text.length - kept.length)
+	}
+	return text
 }
 
 export function envelopeForInjection(contextBody: string): string {
