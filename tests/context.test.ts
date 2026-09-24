@@ -285,7 +285,12 @@ test("fitUnifiedPrompt: the bound holds even when the structure alone is over it
 	const huge = bigUnified(200, 50)
 	const out = fitUnifiedPrompt(huge, 2_000)
 	assert.ok(out.length <= 2_000, `bounded (${out.length})`)
-	assert.ok(out.endsWith("[recall cut to fit the context budget]"))
+	assert.match(out, /\[recall cut to fit the context budget: \d+ more characters not shown\]$/)
+})
+
+test("fitUnifiedPrompt: a bound shorter than the note is still held", () => {
+	const huge = bigUnified(50, 50)
+	for (const bound of [1, 10, 40]) assert.ok(fitUnifiedPrompt(huge, bound).length <= bound, `bound ${bound}`)
 })
 
 test("fitUnifiedPrompt: an answer without forceful_relations is bounded too", () => {

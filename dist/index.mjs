@@ -242,6 +242,7 @@ var SDK_WIRE_OPTS = {
   skipValidation: true,
   breadcrumbsPrefix: ["request"]
 };
+var UNIFIED_CREATE_TIMEOUT_MS = 3e4;
 var LAYOUT_PROBE_TIMEOUT_S = 5;
 var LAYOUT_TTL_MS = 5 * 6e4;
 var UNIFIED_MAX_TEXT_BYTES = 1 << 20;
@@ -276,11 +277,12 @@ function latestTurnsWithinCap(pairs, maxBytes = UNIFIED_MAX_TEXT_BYTES) {
     const size = Buffer.byteLength(pair.user, "utf-8") + Buffer.byteLength(pair.assistant, "utf-8");
     if (used + size > maxBytes) {
       if (kept.length === 0) {
-        const room = Math.max(0, maxBytes - Buffer.byteLength(pair.user, "utf-8"));
-        const assistant = clipUtf8(pair.assistant, room);
+        const userBytes = Buffer.byteLength(pair.user, "utf-8");
+        const assistantBytes = Buffer.byteLength(pair.assistant, "utf-8");
+        const assistantRoom = Math.min(assistantBytes, Math.max(maxBytes - userBytes, Math.floor(maxBytes / 2)));
         kept.push([
-          { role: "user", content: clipUtf8(pair.user, maxBytes) },
-          ...assistant ? [{ role: "assistant", content: assistant }] : []
+          { role: "user", content: clipUtf8(pair.user, maxBytes - assistantRoom) },
+          { role: "assistant", content: clipUtf8(pair.assistant, assistantRoom) }
         ]);
       }
       break;
@@ -542,6 +544,8 @@ var DatabasesResource = class extends Resource {
     let res;
     try {
       res = await doFetch(`${base}${path2}`, {
+        // The same bound the removed hand-built transport had.
+        signal: AbortSignal.timeout(UNIFIED_CREATE_TIMEOUT_MS),
         method: "POST",
         headers: {
           Authorization: `Bearer ${this.transport?.token ?? ""}`,
@@ -1527,8 +1531,10 @@ function fitUnifiedPrompt(response, maxChars) {
     text = lines.join("\n");
   }
   if (text.length > maxChars) {
-    const note = "\n[recall cut to fit the context budget]";
-    const head = text.slice(0, Math.max(0, maxChars - note.length));
+    const note = `
+[recall cut to fit the context budget: ${text.length - maxChars} more characters not shown]`;
+    if (maxChars <= note.length) return text.slice(0, maxChars);
+    const head = text.slice(0, maxChars - note.length);
     const lastLine = head.lastIndexOf("\n");
     text = (lastLine > head.length * 0.8 ? head.slice(0, lastLine) : head) + note;
   }

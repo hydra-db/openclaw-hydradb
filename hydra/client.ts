@@ -209,6 +209,9 @@ const SDK_WIRE_OPTS: SdkParseOptions = {
 	breadcrumbsPrefix: ["request"],
 }
 
+/** The hand-built unified create's bound (the SDK path has its own). */
+const UNIFIED_CREATE_TIMEOUT_MS = 30_000
+
 /** The layout probe runs before the first call: a short budget, no retries. */
 const LAYOUT_PROBE_TIMEOUT_S = 5
 /** How long a probed layout is trusted; see DatabasesResource.layouts. */
@@ -271,12 +274,15 @@ export function latestTurnsWithinCap(
 		const size = Buffer.byteLength(pair.user, "utf-8") + Buffer.byteLength(pair.assistant, "utf-8")
 		if (used + size > maxBytes) {
 			if (kept.length === 0) {
-				// Even the newest pair is over the cap: keep its latest text.
-				const room = Math.max(0, maxBytes - Buffer.byteLength(pair.user, "utf-8"))
-				const assistant = clipUtf8(pair.assistant, room)
+				// Even the newest pair is over the cap. The assistant's reply is
+				// what the turn produced, so it is kept first (up to half the cap
+				// when both are large) and the user's message takes the rest.
+				const userBytes = Buffer.byteLength(pair.user, "utf-8")
+				const assistantBytes = Buffer.byteLength(pair.assistant, "utf-8")
+				const assistantRoom = Math.min(assistantBytes, Math.max(maxBytes - userBytes, Math.floor(maxBytes / 2)))
 				kept.push([
-					{ role: "user", content: clipUtf8(pair.user, maxBytes) },
-					...(assistant ? [{ role: "assistant" as const, content: assistant }] : []),
+					{ role: "user", content: clipUtf8(pair.user, maxBytes - assistantRoom) },
+					{ role: "assistant", content: clipUtf8(pair.assistant, assistantRoom) },
 				])
 			}
 			break
@@ -581,6 +587,8 @@ export class DatabasesResource extends Resource {
 		let res: Response
 		try {
 			res = await doFetch(`${base}${path}`, {
+				// The same bound the removed hand-built transport had.
+				signal: AbortSignal.timeout(UNIFIED_CREATE_TIMEOUT_MS),
 				method: "POST",
 				headers: {
 					Authorization: `Bearer ${this.transport?.token ?? ""}`,

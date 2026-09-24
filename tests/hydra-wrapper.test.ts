@@ -203,6 +203,30 @@ test("unified ingest keeps the latest turns within the per-item cap", async () =
 	assert.ok(turns[0]!.content.startsWith("q2"), "the oldest turns are the ones dropped")
 })
 
+test("an oversized newest exchange keeps the assistant's reply", async () => {
+	const { fetch, sent } = sdkServer(() => ({ status: 202, body: env({ success_count: 1, failed_count: 0, results: [] }) }))
+	const hydra = new HydraDB({ token: "t", database: "db_u", baseUrl: "https://api.test", fetch })
+	await hydra.context.ingest({
+		kind: "unified",
+		pairs: [{ user: "p".repeat(UNIFIED_MAX_TEXT_BYTES + 5000), assistant: "the reply that must survive" }],
+	})
+	const turns = JSON.parse(sent[0]!.form!.context!)[0].conversation as { role: string; content: string }[]
+	assert.deepEqual(turns.map((t) => t.role), ["user", "assistant"])
+	assert.equal(turns[1]!.content, "the reply that must survive")
+	assert.ok(turns.reduce((n, t) => n + Buffer.byteLength(t.content), 0) <= UNIFIED_MAX_TEXT_BYTES)
+})
+
+test("the hand-built unified create is bounded by a timeout", async () => {
+	let signal: AbortSignal | undefined
+	const impl = (async (_url: string | URL | Request, init?: RequestInit) => {
+		signal = init?.signal ?? undefined
+		return new Response(JSON.stringify(env({ status: "accepted" })), { status: 200, headers: { "content-type": "application/json" } })
+	}) as typeof fetch
+	const hydra = new HydraDB({ token: "t", database: "a", baseUrl: "https://api.test", fetch: impl })
+	await hydra.databases.create({ database: "new", type: "unified" })
+	assert.ok(signal instanceof AbortSignal, "the request carries an abort signal")
+})
+
 test("unified ingest refuses a single text over the per-item cap before sending", async () => {
 	const { fetch, sent } = sdkServer(() => ({ status: 202, body: env({}) }))
 	const hydra = new HydraDB({ token: "t", database: "db_u", baseUrl: "https://api.test", fetch })

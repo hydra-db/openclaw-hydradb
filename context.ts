@@ -255,10 +255,11 @@ function cutAtWord(text: string, max: number): string | undefined {
  * not parsed for structure. The answer's own chunks say which text is result
  * body: every copy of it is found in the prompt and shortened in place,
  * sharing the room left by everything else, each cut marked with the item's
- * id. Headings, ids, labels and the related-facts section are never touched.
- * If the prompt is still over, long non-structural lines are shortened, and
- * only then is it cut at a line with a note, so the bound always holds. A
- * prompt that fits is returned as sent.
+ * id. Headings, ids, labels and the related-facts section are not touched.
+ * If the prompt is still over, long non-structural lines are shortened. Only
+ * when the structure alone exceeds the bound is the tail cut at a line with a
+ * note, so the bound always holds; that last resort can drop later results'
+ * headings and labels. A prompt that fits is returned as sent.
  */
 export function fitUnifiedPrompt(response: UnifiedQueryResponse, maxChars: number): string {
 	const prompt = typeof response.llm_prompt === "string" ? response.llm_prompt : ""
@@ -330,9 +331,14 @@ export function fitUnifiedPrompt(response: UnifiedQueryResponse, maxChars: numbe
 		text = lines.join("\n")
 	}
 
+	// Last resort, only when the answer's own structure (headings, ids,
+	// sources, facts) is over the bound: the bound holds and the tail is cut,
+	// so later results can lose their headings and labels here. The note says
+	// how much was cut. A bound shorter than the note is a plain prefix.
 	if (text.length > maxChars) {
-		const note = "\n[recall cut to fit the context budget]"
-		const head = text.slice(0, Math.max(0, maxChars - note.length))
+		const note = `\n[recall cut to fit the context budget: ${text.length - maxChars} more characters not shown]`
+		if (maxChars <= note.length) return text.slice(0, maxChars)
+		const head = text.slice(0, maxChars - note.length)
 		const lastLine = head.lastIndexOf("\n")
 		text = (lastLine > head.length * 0.8 ? head.slice(0, lastLine) : head) + note
 	}
