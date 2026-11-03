@@ -154,6 +154,8 @@ function invoke(hydra: HydraDB, op: string, args: Record<string, unknown>): Prom
 			return hydra.databases.collections(a.database)
 		case "database.readiness":
 			return hydra.databases.readiness(a.database)
+		case "database.stats":
+			return hydra.databases.stats(a.database)
 		default:
 			throw new Error(`conformance: unhandled op "${op}"`)
 	}
