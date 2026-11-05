@@ -1,6 +1,6 @@
 {
   "name": "@hydradb/openclaw",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "type": "module",
   "description": "OpenClaw plugin for Hydra DB: The State-of-the-art agentic memory system with auto-capture, recall, and knowledge graph context for open-claw",
   "license": "Apache-2.0",
