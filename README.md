@@ -10,6 +10,15 @@ openclaw plugins install @hydradb/openclaw
 
 Restart OpenClaw after installing.
 
+Use `@hydradb/openclaw` v0.1.0 or newer, which targets the Hydra DB v2 API. If
+you installed the earlier `0.0.1` build (v1 API), upgrade and restart the
+gateway; no config changes are needed:
+
+```bash
+openclaw plugins install @hydradb/openclaw@latest
+openclaw gateway restart
+```
+
 If you run OpenClaw via the local gateway, restart it too:
 
 ```bash
