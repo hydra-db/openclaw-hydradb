@@ -10,6 +10,11 @@ export type HydraPluginConfig = {
 	graphContext: boolean
 	ignoreTerm: string
 	debug: boolean
+	/**
+	 * Storage layout of the configured database (PRO-1618). `auto` (default)
+	 * reads it from `GET /databases` once; `split`/`unified` pin it.
+	 */
+	layout: "split" | "unified" | "auto"
 }
 
 const KNOWN_KEYS = new Set([
@@ -23,6 +28,7 @@ const KNOWN_KEYS = new Set([
 	"graphContext",
 	"ignoreTerm",
 	"debug",
+	"layout",
 ])
 
 const DEFAULT_SUB_TENANT = "hydra-openclaw-plugin"
@@ -132,7 +138,14 @@ export function parseConfig(raw: unknown): HydraPluginConfig {
 				? cfg.ignoreTerm
 				: DEFAULT_IGNORE_TERM,
 		debug: (cfg.debug as boolean) ?? false,
+		layout: parseLayout(cfg.layout),
 	}
+}
+
+function parseLayout(value: unknown): "split" | "unified" | "auto" {
+	if (value === undefined) return "auto"
+	if (value === "split" || value === "unified" || value === "auto") return value
+	throw new Error(`hydra-db: layout must be "split", "unified" or "auto"`)
 }
 
 export function tryParseConfig(raw: unknown): HydraPluginConfig | null {

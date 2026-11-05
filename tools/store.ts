@@ -3,17 +3,13 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk"
 import type { HydraClient } from "../client.ts"
 import type { HydraPluginConfig } from "../config.ts"
 import { log } from "../log.ts"
-import { extractAllTurns, filterIgnoredTurns } from "../messages.ts"
+import { extractAllTurns, filterIgnoredTurns, toIngestableTurns } from "../messages.ts"
 import { toToolSourceId } from "../session.ts"
 import { TOOL_NAMES } from "../tool-names.ts"
 import type { ConversationTurn } from "../types/hydra.ts"
 import { registerToolWithAlias } from "./register.ts"
 
 const MAX_STORE_TURNS = 10
-
-function removeInjectedBlocks(text: string): string {
-	return text.replace(/<hydra-context>[\s\S]*?<\/hydra-context>\s*/g, "").trim()
-}
 
 export function registerStoreTool(
 	api: OpenClawPluginApi,
@@ -51,10 +47,7 @@ export function registerStoreTool(
 				const rawTurns = extractAllTurns(messages)
 				const filteredTurns = filterIgnoredTurns(rawTurns, cfg.ignoreTerm)
 				const recentTurns = filteredTurns.slice(-MAX_STORE_TURNS)
-				const turns: ConversationTurn[] = recentTurns.map((t) => ({
-					user: removeInjectedBlocks(t.user),
-					assistant: removeInjectedBlocks(t.assistant),
-				}))
+				const turns: ConversationTurn[] = toIngestableTurns(recentTurns)
 
 				log.debug(`[store] extracted ${rawTurns.length} total turns, ${rawTurns.length - filteredTurns.length} ignored, using last ${turns.length} (MAX_STORE_TURNS=${MAX_STORE_TURNS})`)
 

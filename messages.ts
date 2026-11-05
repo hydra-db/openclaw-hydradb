@@ -15,6 +15,42 @@ export function filterIgnoredTurns(
 	)
 }
 
+/**
+ * Strip the `<hydra-context>` blocks auto-recall injects, so a captured turn
+ * carries what the user and the model actually said and never the recall the
+ * plugin fed back in.
+ */
+export function removeInjectedBlocks(text: string): string {
+	return text.replace(/<hydra-context>[\s\S]*?<\/hydra-context>\s*/g, "").trim()
+}
+
+/**
+ * The shortest turn worth storing. A turn below this is what is left after the
+ * injected blocks are stripped — an assistant reply that was ENTIRELY a recall
+ * block trims to `""` — and an empty half is not context, it is noise.
+ */
+const MIN_TURN_CHARS = 5
+
+/**
+ * Clean a run of turns and drop the ones that no longer carry anything.
+ *
+ * PRO-1618: the filter is not cosmetic. A unified database rejects an item with
+ * an empty conversation turn, and rejects the WHOLE request when it does, so a
+ * single stripped-to-nothing turn loses the entire capture — and the retry that
+ * saves every other layout mistake cannot help, because the kind is already
+ * `unified`. The hook path and the store tool build turns identically, so they
+ * share this function rather than each keeping their own copy: the store tool
+ * was missing the filter, which is exactly how the two drifted.
+ */
+export function toIngestableTurns(turns: ConversationTurn[]): ConversationTurn[] {
+	return turns
+		.map((t) => ({
+			user: removeInjectedBlocks(t.user),
+			assistant: removeInjectedBlocks(t.assistant),
+		}))
+		.filter((t) => t.user.length >= MIN_TURN_CHARS && t.assistant.length >= MIN_TURN_CHARS)
+}
+
 export function textFromMessage(msg: Record<string, unknown>): string {
 	const content = msg.content
 	if (typeof content === "string") return content

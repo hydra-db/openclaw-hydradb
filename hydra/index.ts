@@ -20,6 +20,12 @@ export type {
 	RelationsParams,
 	DeleteParams,
 	CreateDatabaseParams,
+	Layout,
 } from "./client.ts"
-export { HydraWrapperError, translateError } from "./errors.ts"
+export {
+	HydraWrapperError,
+	isUnifiedLayoutRefusal,
+	translateError,
+	CORPUS_TYPE_UNSUPPORTED_CODE,
+} from "./errors.ts"
 export { unwrap } from "./envelope.ts"

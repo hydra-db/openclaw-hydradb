@@ -28,7 +28,7 @@ export default {
 	register(api: OpenClawPluginApi) {
 		const cfg = tryParseConfig(api.pluginConfig)
 		const cliClient = cfg
-			? new HydraClient(cfg.apiKey, cfg.tenantId, cfg.subTenantId, cfg.baseUrl)
+			? new HydraClient(cfg.apiKey, cfg.tenantId, cfg.subTenantId, cfg.baseUrl, undefined, cfg.layout)
 			: null
 
 		// Always register ALL CLI commands so they appear in help text.
@@ -68,7 +68,7 @@ export default {
 		// Full plugin registration — credentials present
 		log.init(api.logger, cfg.debug)
 
-		const client = new HydraClient(cfg.apiKey, cfg.tenantId, cfg.subTenantId, cfg.baseUrl)
+		const client = new HydraClient(cfg.apiKey, cfg.tenantId, cfg.subTenantId, cfg.baseUrl, undefined, cfg.layout)
 
 		let activeSessionId: string | undefined
 		let conversationMessages: unknown[] = []
